@@ -61,7 +61,7 @@ idle_fps = 60          # 平常的刷新率；節拍期間會拉到面板所在�
                        # "DELL P2421D" = 8
 
 [beat]
-style = "auto"         # auto | ball | ring | pulse；auto＝ball，系統開「減少動態效果」時改 pulse
+style = "auto"         # auto | ball | ring | pulse；auto＝ball，系統開「減少動態效果」時改 pulse；選單「節拍樣式」可暫時蓋過，改這裡就回到依主題檔
 renderer = "auto"      # auto | metal | layer；auto＝有 Metal 就用 Metal 畫節拍區並量每一格實際上屏的時刻，layer＝CALayer
 period_ms = 1000       # 拍距
 ticks = 4              # 拍數，含歸零那一拍；聲音從第一拍起，畫面提早一拍起跑

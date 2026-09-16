@@ -22,11 +22,14 @@ pub enum StripKind {
 }
 
 impl StripKind {
-    pub fn label(self) -> &'static str {
+    pub const ALL: [StripKind; 3] = [StripKind::Ball, StripKind::Ring, StripKind::Pulse];
+
+    /// 選單與紀錄用的中文名。
+    pub fn title(self) -> &'static str {
         match self {
-            StripKind::Ball => "ball",
-            StripKind::Ring => "ring",
-            StripKind::Pulse => "pulse",
+            StripKind::Ball => "球",
+            StripKind::Ring => "環",
+            StripKind::Pulse => "脈衝",
         }
     }
 }

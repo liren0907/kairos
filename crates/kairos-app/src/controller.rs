@@ -130,6 +130,8 @@ pub struct MenuItems {
     pub beat_stop: Retained<NSMenuItem>,
     pub sound: Retained<NSMenuItem>,
     pub glow: Retained<NSMenuItem>,
+    /// 「節拍樣式」子選單：`None` 是「依主題檔」，其餘是強制的樣式。
+    pub style: Vec<(Option<StripKind>, Retained<NSMenuItem>)>,
     pub clear_target: Retained<NSMenuItem>,
 }
 
@@ -215,6 +217,8 @@ struct State {
     beat: RefCell<Option<BeatSession>>,
     sound_on: Cell<bool>,
     glow_on: Cell<bool>,
+    /// 選單「節拍樣式」的選擇：`None` 依主題檔；主題檔的 `style` 一改就清掉（最後一次動作為準）。
+    style_override: Cell<Option<StripKind>>,
     /// 目標時刻：檔案、狀態機、面板、校正。
     store_path: PathBuf,
     store: RefCell<TargetFile>,
@@ -280,6 +284,22 @@ define_class!(
         #[unsafe(method(toggleGlow:))]
         fn toggle_glow_action(&self, _sender: Option<&AnyObject>) {
             self.toggle_glow();
+        }
+
+        /// 「節拍樣式」子選單的四個項目共用這個動作，靠 `tag` 分：0 依主題檔，1 球，2 環，3 脈衝。
+        #[unsafe(method(setBeatStyle:))]
+        fn set_beat_style_action(&self, sender: Option<&AnyObject>) {
+            let tag = sender
+                .and_then(|s| s.downcast_ref::<NSMenuItem>())
+                .map(|item| item.tag())
+                .unwrap_or(0);
+            let choice = match tag {
+                1 => Some(StripKind::Ball),
+                2 => Some(StripKind::Ring),
+                3 => Some(StripKind::Pulse),
+                _ => None,
+            };
+            self.set_beat_style(choice);
         }
 
         #[unsafe(method(showTargetPanel:))]
@@ -390,6 +410,7 @@ impl Controller {
             beat: RefCell::new(None),
             sound_on: Cell::new(true),
             glow_on: Cell::new(true),
+            style_override: Cell::new(None),
             store_path,
             store: RefCell::new(store),
             target: RefCell::new(target),
@@ -543,7 +564,29 @@ impl Controller {
                     return;
                 }
                 let sync_changed = iv.theme.borrow().sync != new.sync;
+                let style_changed = iv.theme.borrow().beat.style != new.beat.style;
                 *iv.theme.borrow_mut() = new;
+                if style_changed {
+                    // 最後一次動作為準：主題檔改了樣式，選單的指定就作廢。
+                    let had_override = iv.style_override.replace(None).is_some();
+                    let reduce_motion =
+                        NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
+                    let kind = self.resolve_kind(&iv.theme.borrow(), reduce_motion);
+                    // 進行中的節拍也換過去；下面的 rebuild_face 會用新的 kind 重建節拍區。
+                    if let Some(session) = iv.beat.borrow_mut().as_mut() {
+                        session.kind = kind;
+                    }
+                    self.refresh_style_menu();
+                    eprintln!(
+                        "主題：[beat] style 有變，節拍樣式改為{}{}",
+                        kind.title(),
+                        if had_override {
+                            "（選單的指定作廢，回到依主題檔）"
+                        } else {
+                            ""
+                        }
+                    );
+                }
                 self.rebuild_face(false);
                 self.refresh_screen(false);
                 eprintln!("主題：已重新載入 {}", iv.theme_path.display());
@@ -661,12 +704,7 @@ impl Controller {
         }
 
         let reduce_motion = NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
-        let kind = match theme.beat.style {
-            BeatStyle::Auto if reduce_motion => StripKind::Pulse,
-            BeatStyle::Auto | BeatStyle::Ball => StripKind::Ball,
-            BeatStyle::Ring => StripKind::Ring,
-            BeatStyle::Pulse => StripKind::Pulse,
-        };
+        let kind = self.resolve_kind(&theme, reduce_motion);
         let glow = (theme.beat.glow && iv.glow_on.get() && !reduce_motion)
             .then(|| Glow::build(self.mtm(), &theme));
         let audio = if iv.sound_on.get() {
@@ -698,12 +736,17 @@ impl Controller {
             }
         };
         let summary = format!(
-            "節拍（{}）：歸零於本地時間 {zero_local}（{:.3} 秒後），{} 拍、拍距 {} ms、樣式 {}、聲音{}、光暈 {} 個螢幕、刷新率 {:.0} Hz{}{}",
+            "節拍（{}）：歸零於本地時間 {zero_local}（{:.3} 秒後），{} 拍、拍距 {} ms、樣式 {}{}、聲音{}、光暈 {} 個螢幕、刷新率 {:.0} Hz{}{}",
             purpose.label(),
             plan.zero.saturating_duration_since(now).as_secs_f64(),
             plan.ticks,
             theme.beat.period_ms,
-            kind.label(),
+            kind.title(),
+            if iv.style_override.get().is_some() {
+                "（選單指定）"
+            } else {
+                ""
+            },
             if audio.is_some() { "開" } else { "關" },
             glow.as_ref().map(|g| g.screen_count()).unwrap_or(0),
             iv.screen_fps.get(),
@@ -890,6 +933,73 @@ impl Controller {
             }
         }
         eprintln!("邊緣光暈：{}", if on { "開" } else { "關" });
+    }
+
+    /// 這一次節拍區該畫什麼：選單有指定就照選單，否則照主題檔（`auto` 看「減少動態效果」）。
+    fn resolve_kind(&self, theme: &Theme, reduce_motion: bool) -> StripKind {
+        if let Some(kind) = self.state().style_override.get() {
+            return kind;
+        }
+        match theme.beat.style {
+            BeatStyle::Auto if reduce_motion => StripKind::Pulse,
+            BeatStyle::Auto | BeatStyle::Ball => StripKind::Ball,
+            BeatStyle::Ring => StripKind::Ring,
+            BeatStyle::Pulse => StripKind::Pulse,
+        }
+    }
+
+    /// 選單「節拍樣式」：`None` 回到依主題檔。程序進行中切換會立刻重建節拍區
+    /// （Metal 的上屏統計從那一刻起重算），沒在跑就下一次節拍起生效。
+    pub fn set_beat_style(&self, choice: Option<StripKind>) {
+        let iv = self.state();
+        iv.style_override.set(choice);
+        self.refresh_style_menu();
+        let reduce_motion = NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
+        let kind = self.resolve_kind(&iv.theme.borrow(), reduce_motion);
+        let mut what = match choice {
+            Some(k) => format!("節拍樣式：{}（選單指定）", k.title()),
+            None => format!("節拍樣式：依主題檔（目前是{}）", kind.title()),
+        };
+        what.push_str(if self.retarget_running_strip(kind) {
+            "，進行中的節拍立刻換，上屏統計從現在起重算"
+        } else {
+            "，下一次節拍起生效"
+        });
+        eprintln!("{what}");
+    }
+
+    /// 有節拍在跑、而且樣式跟現在畫的不同，就換掉並重建面板；回傳有沒有真的重建。
+    fn retarget_running_strip(&self, kind: StripKind) -> bool {
+        let iv = self.state();
+        let changed = {
+            let mut beat = iv.beat.borrow_mut();
+            match beat.as_mut() {
+                Some(session) if session.kind != kind => {
+                    session.kind = kind;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.rebuild_face(true);
+        }
+        changed
+    }
+
+    /// 讓「節拍樣式」子選單只勾目前的選擇。
+    fn refresh_style_menu(&self) {
+        let iv = self.state();
+        if let Some(menu) = iv.menu.borrow().as_ref() {
+            let current = iv.style_override.get();
+            for (choice, item) in &menu.style {
+                item.setState(if *choice == current {
+                    NSControlStateValueOn
+                } else {
+                    NSControlStateValueOff
+                });
+            }
+        }
     }
 
     // ---------- 目標時刻 ----------

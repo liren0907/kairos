@@ -43,6 +43,7 @@ use objc2_foundation::{
 use kairos_core::sync::{SamplerConfig, SamplerHandle, SyncStatus};
 use kairos_core::time::{HostTime, Timebase, system_theta_ns};
 
+use beat_view::StripKind;
 use controller::{Controller, MenuItems};
 
 /// App Nap 的活動 token。它被 drop 就等於結束活動、App Nap 重新生效，
@@ -128,6 +129,25 @@ fn action_item(
     item
 }
 
+/// 「節拍樣式」子選單的四個項目，共用 `setBeatStyle:`，靠 `tag` 分辨：0 依主題檔，之後照
+/// `StripKind::ALL` 的順序。一開始勾「依主題檔」。
+fn build_style_items(
+    mtm: MainThreadMarker,
+    target: &AnyObject,
+) -> Vec<(Option<StripKind>, Retained<NSMenuItem>)> {
+    let mut items = Vec::with_capacity(1 + StripKind::ALL.len());
+    let theme_item = action_item(mtm, "依主題檔", sel!(setBeatStyle:), target);
+    theme_item.setTag(0);
+    theme_item.setState(NSControlStateValueOn);
+    items.push((None, theme_item));
+    for (i, kind) in StripKind::ALL.into_iter().enumerate() {
+        let item = action_item(mtm, kind.title(), sel!(setBeatStyle:), target);
+        item.setTag(i as isize + 1);
+        items.push((Some(kind), item));
+    }
+    items
+}
+
 fn build_status_item(
     mtm: MainThreadMarker,
     controller: &Controller,
@@ -184,8 +204,17 @@ fn build_status_item(
         beat_stop: action_item(mtm, "停止節拍", sel!(stopBeats:), target),
         sound: action_item(mtm, "節拍聲音", sel!(toggleSound:), target),
         glow: action_item(mtm, "邊緣光暈", sel!(toggleGlow:), target),
+        style: build_style_items(mtm, target),
         clear_target: action_item(mtm, "解除目標", sel!(clearTarget:), target),
     };
+    let style_menu = NSMenu::new(mtm);
+    style_menu.setAutoenablesItems(false);
+    for (_, item) in &items.style {
+        style_menu.addItem(item);
+    }
+    let style_item = NSMenuItem::new(mtm);
+    style_item.setTitle(&NSString::from_str("節拍樣式"));
+    style_item.setSubmenu(Some(&style_menu));
     menu.addItem(&items.panel);
     menu.addItem(&items.click_through);
     menu.addItem(&action_item(
@@ -218,6 +247,7 @@ fn build_status_item(
     items.glow.setState(NSControlStateValueOn);
     menu.addItem(&items.beat_start);
     menu.addItem(&items.beat_stop);
+    menu.addItem(&style_item);
     menu.addItem(&items.sound);
     menu.addItem(&items.glow);
     menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -370,7 +400,7 @@ fn main() {
 
     controller.start();
     eprintln!(
-        "面板已顯示；選單列的碼錶圖示可隱藏面板、切換滑鼠穿透、重新載入主題、設目標時刻、校正反應時間、試聽節拍，Quit 或 Cmd-Q 結束"
+        "面板已顯示；選單列的碼錶圖示可隱藏面板、切換滑鼠穿透、重新載入主題、設目標時刻、校正反應時間、試聽節拍、換節拍樣式，Quit 或 Cmd-Q 結束"
     );
 
     app.run();
