@@ -12,7 +12,9 @@
 //! - [`model`]：不可變的時鐘模型，呈現層每一格讀一次、用 `estimate_at` 換出當下的遠端時間與不確定度。
 //! - [`sync`]：背景執行緒定期取樣、算模型、發布到 [`sync::ModelSlot`]；睡眠偵測也在這裡。
 //! - [`display`]：呈現層用的純邏輯——顯示偏移平滑器、本地時分秒拆解。
+//! - [`beat`]：以主機時間表示的拍點表，以及滴答聲與節拍元件的純函數；畫面、聲音、光暈共用同一份表。
 
+pub mod beat;
 pub mod display;
 pub mod estimate;
 pub mod model;

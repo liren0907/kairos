@@ -90,6 +90,26 @@ impl ClockModel {
         }
     }
 
+    /// 反解：遠端時刻 `remote_unix_ns` 對應的主機時刻。
+    ///
+    /// θ 本身隨主機時間漂移，所以解 `m = remote − θ(m)` 用定點迭代：每一輪誤差乘以 ρ
+    /// （先驗上限 500 ppm），八輪內一定收斂到 1 ns 以內。回傳值再經 tick 量化，
+    /// 與 [`estimate_at`](Self::estimate_at) 往返的誤差在幾十奈秒之內。
+    pub fn host_at(&self, remote_unix_ns: i128) -> HostTime {
+        let m0_ns = self.reference.as_nanos() as i128;
+        let mut m_ns = remote_unix_ns - self.offset_ns;
+        for _ in 0..8 {
+            let theta = self.offset_ns + (self.drift * (m_ns - m0_ns) as f64) as i128;
+            let next = remote_unix_ns - theta;
+            let step = (next - m_ns).abs();
+            m_ns = next;
+            if step <= 1 {
+                break;
+            }
+        }
+        HostTime::from_nanos(m_ns.clamp(0, u64::MAX as i128) as u64)
+    }
+
     pub fn is_usable(&self) -> bool {
         !matches!(self.status, ModelStatus::Uncalibrated) && self.half_width_ns != u64::MAX
     }
@@ -153,5 +173,24 @@ mod tests {
         let before = m.estimate_at(m0 - Duration::from_secs(3));
         let after = m.estimate_at(m0 + Duration::from_secs(3));
         assert!((before.half_width_ns as i128 - after.half_width_ns as i128).abs() < 1_000);
+    }
+
+    #[test]
+    fn host_at_inverts_estimate_at() {
+        let m0 = HostTime::from_nanos(7_200 * 1_000_000_000);
+        for drift in [0.0, 20e-6, -500e-6, 500e-6] {
+            let mut m = tracking(m0);
+            m.drift = drift;
+            for secs in [-3_600i128, -1, 0, 1, 600, 3_600] {
+                let target = m.estimate_at(m0).remote_unix_ns + secs * 1_000_000_000 + 123_456_789;
+                let host = m.host_at(target);
+                let back = m.estimate_at(host).remote_unix_ns;
+                assert!(
+                    (back - target).abs() <= 100,
+                    "drift {drift} secs {secs}: 往返差 {} ns",
+                    back - target
+                );
+            }
+        }
     }
 }

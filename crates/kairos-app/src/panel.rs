@@ -18,6 +18,7 @@ use objc2_quartz_core::CALayer;
 use kairos_core::display::DIGIT_CELLS;
 
 use crate::atlas::GlyphAtlas;
+use crate::beat_view::{BeatStrip, StripKind};
 use crate::theme::Theme;
 
 /// 面板視窗與兩層 view。程式生命週期內不重建；主題變了只改屬性與大小。
@@ -104,8 +105,9 @@ pub fn build_panel(mtm: MainThreadMarker, theme: &Theme) -> PanelViews {
 }
 
 impl PanelViews {
-    /// 套用主題裡跟視窗本身有關的部分，並把內容區改成 `width × height`，左上角不動。
-    pub fn apply_theme(&self, theme: &Theme, height: f64) {
+    /// 套用主題裡跟視窗本身有關的部分，並把內容區改成 `width × height`。
+    /// 平常左上角不動；節拍區出現或消失時改成左下角不動，數字才不會跳。
+    pub fn apply_theme(&self, theme: &Theme, height: f64, keep_bottom: bool) {
         self.panel.setAlphaValue(theme.panel.opacity);
         self.panel
             .setAppearance(theme.panel.appearance.ns().as_deref());
@@ -119,7 +121,11 @@ impl PanelViews {
         let top_left = CGPoint::new(f.origin.x, f.origin.y + f.size.height);
         self.panel
             .setContentSize(CGSize::new(theme.panel.width, height));
-        self.panel.setFrameTopLeftPoint(top_left);
+        if keep_bottom {
+            self.panel.setFrameOrigin(f.origin);
+        } else {
+            self.panel.setFrameTopLeftPoint(top_left);
+        }
     }
 
     pub fn scale(&self) -> f64 {
@@ -127,11 +133,13 @@ impl PanelViews {
     }
 }
 
-/// 面板上會變的東西。主題或螢幕縮放變了就整個重建。
+/// 面板上會變的東西。主題、螢幕縮放變了，或節拍區出現／消失，就整個重建。
 pub struct Face {
     pub atlas: GlyphAtlas,
     /// 面板內容區需要的高度（點）。
     pub height: f64,
+    /// 節拍區，只在節拍期間有。
+    pub strip: Option<BeatStrip>,
     digits: Vec<Retained<CALayer>>,
     shown: [u8; DIGIT_CELLS],
     bar_track: Retained<CALayer>,
@@ -147,7 +155,13 @@ pub struct Face {
 }
 
 impl Face {
-    pub fn build(mtm: MainThreadMarker, views: &PanelViews, theme: &Theme, scale: f64) -> Face {
+    pub fn build(
+        mtm: MainThreadMarker,
+        views: &PanelViews,
+        theme: &Theme,
+        scale: f64,
+        strip: Option<StripKind>,
+    ) -> Face {
         let time_font_px = theme.font.nsfont(theme.font.time_size * scale);
         let atlas = GlyphAtlas::render(&time_font_px, &theme.colors.time.nscolor(), scale);
 
@@ -166,7 +180,13 @@ impl Face {
         let bar_y = caption_y + caption_h + gap;
         let detail_y = bar_y + bar_h + gap;
         let digits_y = detail_y + detail_h + gap;
-        let height = digits_y + atlas.cell_height + p;
+        let digits_top = digits_y + atlas.cell_height;
+        // 節拍區在數字上方。
+        let strip_h = theme.beat.strip_height.max(24.0);
+        let height = match strip {
+            Some(_) => digits_top + gap + strip_h + p,
+            None => digits_top + p,
+        };
 
         // 十二格數字，水平置中。
         let pattern = b"HH:MM:SS.mmm";
@@ -236,9 +256,22 @@ impl Face {
             caption_h,
         );
 
+        let strip = strip.map(|kind| {
+            BeatStrip::build(
+                &views.root_layer,
+                theme,
+                kind,
+                p,
+                digits_top + gap,
+                width - 2.0 * p,
+                strip_h,
+            )
+        });
+
         Face {
             atlas,
             height,
+            strip,
             digits,
             shown: [0; DIGIT_CELLS],
             bar_track,
@@ -263,6 +296,9 @@ impl Face {
         self.bar_fill.removeFromSuperlayer();
         self.detail.removeFromSuperview();
         self.caption.removeFromSuperview();
+        if let Some(strip) = &self.strip {
+            strip.teardown();
+        }
     }
 
     /// 只換有變的格子。呼叫端要包在關掉隱式動畫的 `CATransaction` 裡。

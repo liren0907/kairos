@@ -4,9 +4,11 @@
 //! 檔案不存在時寫入 [`DEFAULT_THEME_TOML`]（含註解）；解析失敗時沿用上一版並印到 stderr。
 //! 欄位名打錯會直接報錯（`deny_unknown_fields`），比默默忽略好找。
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use objc2::rc::Retained;
@@ -17,6 +19,8 @@ use objc2_app_kit::{
 };
 use objc2_foundation::NSString;
 use serde::Deserialize;
+
+use kairos_core::beat::audio::TickSound;
 
 /// 預設主題，也是第一次啟動時寫到磁碟的內容。
 pub const DEFAULT_THEME_TOML: &str = r##"# kairos 主題檔。存檔即時生效；寫錯會在終端機印出錯誤並沿用上一版。
@@ -49,8 +53,27 @@ bar_height = 4
 bar_full_scale_ms = 50 # 不確定度長條滿格對應的 ± 毫秒數
 
 [display]
-lead_ms = 0            # 顯示提前量：畫面實際上屏比 targetTimestamp 晚多少毫秒（階段三改成每個螢幕各一個值）
-idle_fps = 60          # 平常的刷新率；倒數時階段三會拉到螢幕最高
+lead_ms = 0            # 顯示提前量的預設值：畫面實際上屏比 targetTimestamp 晚多少毫秒
+idle_fps = 60          # 平常的刷新率；節拍期間會拉到面板所在螢幕的最高刷新率
+
+[display.screens]      # 依螢幕名稱覆寫 lead_ms；名稱看啟動時終端機印的螢幕清單，例如：
+                       # "DELL P2421D" = 8
+
+[beat]
+style = "auto"         # auto | ball | ring | pulse；auto＝ball，系統開「減少動態效果」時改 pulse
+period_ms = 1000       # 拍距
+ticks = 4              # 拍數，含歸零那一拍；聲音從第一拍起，畫面提早一拍起跑
+strip_height = 64      # 節拍區高度（點），只在節拍期間出現在數字上方
+color = "#5AA9FF"
+final_color = "#FFB454" # 歸零拍的顏色（尺寸也放大）
+glow = true            # 螢幕邊緣光暈（每個螢幕一層，滑鼠穿透）
+glow_width = 48        # 光暈寬度（點）
+glow_opacity = 0.35    # 光暈最亮時的不透明度
+volume = 0.5           # 0 到 1
+tick_hz = 1000         # 前導拍與歸零拍同音高
+tick_ms = 30           # 前導拍長度
+final_ms = 200         # 歸零拍長度
+visual_lead_ms = 0     # 畫面相對聲音的提前量：正值＝畫面先到；主觀覺得畫面慢就調正
 "##;
 
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
@@ -265,6 +288,8 @@ impl Default for Layout {
 pub struct Display {
     pub lead_ms: f64,
     pub idle_fps: f64,
+    /// 依螢幕名稱（`NSScreen.localizedName`）覆寫 `lead_ms`。
+    pub screens: BTreeMap<String, f64>,
 }
 
 impl Default for Display {
@@ -272,7 +297,90 @@ impl Default for Display {
         Display {
             lead_ms: 0.0,
             idle_fps: 60.0,
+            screens: BTreeMap::new(),
         }
+    }
+}
+
+impl Display {
+    /// 這個螢幕的顯示提前量：有覆寫就用覆寫，否則用預設值。
+    pub fn lead_ms_for(&self, screen: Option<&str>) -> f64 {
+        screen
+            .and_then(|n| self.screens.get(n))
+            .copied()
+            .unwrap_or(self.lead_ms)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BeatStyle {
+    Auto,
+    Ball,
+    Ring,
+    Pulse,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Beat {
+    pub style: BeatStyle,
+    pub period_ms: f64,
+    pub ticks: u32,
+    pub strip_height: f64,
+    pub color: Color,
+    pub final_color: Color,
+    pub glow: bool,
+    pub glow_width: f64,
+    pub glow_opacity: f64,
+    pub volume: f64,
+    pub tick_hz: f64,
+    pub tick_ms: f64,
+    pub final_ms: f64,
+    pub visual_lead_ms: f64,
+}
+
+impl Default for Beat {
+    fn default() -> Self {
+        Beat {
+            style: BeatStyle::Auto,
+            period_ms: 1000.0,
+            ticks: 4,
+            strip_height: 64.0,
+            color: Color::rgba(0x5A as f64 / 255.0, 0xA9 as f64 / 255.0, 1.0, 1.0),
+            final_color: Color::rgba(1.0, 0xB4 as f64 / 255.0, 0x54 as f64 / 255.0, 1.0),
+            glow: true,
+            glow_width: 48.0,
+            glow_opacity: 0.35,
+            volume: 0.5,
+            tick_hz: 1000.0,
+            tick_ms: 30.0,
+            final_ms: 200.0,
+            visual_lead_ms: 0.0,
+        }
+    }
+}
+
+impl Beat {
+    pub fn period(&self) -> Duration {
+        Duration::from_secs_f64(self.period_ms.max(1.0) / 1e3)
+    }
+
+    pub fn sound(&self) -> TickSound {
+        TickSound {
+            hz: self.tick_hz.clamp(20.0, 20_000.0),
+            tick: Duration::from_secs_f64(self.tick_ms.max(1.0) / 1e3),
+            final_tick: Duration::from_secs_f64(self.final_ms.max(1.0) / 1e3),
+            volume: self.volume.clamp(0.0, 1.0) as f32,
+        }
+    }
+
+    /// 畫面相對聲音的提前量，可負。
+    pub fn visual_lead(&self) -> (bool, Duration) {
+        (
+            self.visual_lead_ms >= 0.0,
+            Duration::from_secs_f64(self.visual_lead_ms.abs() / 1e3),
+        )
     }
 }
 
@@ -284,6 +392,7 @@ pub struct Theme {
     pub colors: Colors,
     pub layout: Layout,
     pub display: Display,
+    pub beat: Beat,
 }
 
 impl Theme {
@@ -309,6 +418,14 @@ impl Theme {
             eprintln!("主題：已建立 {}", path.display());
         }
         let text = fs::read_to_string(path)?;
+        for section in ["[display.screens]", "[beat]"] {
+            if !text.contains(section) {
+                eprintln!(
+                    "主題：{} 沒有 {section} 段落，用預設值；想看所有可調的鍵，刪掉這個檔案重啟就會重新產生",
+                    path.display()
+                );
+            }
+        }
         Theme::parse(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
 }
@@ -358,5 +475,20 @@ mod tests {
         assert_eq!(t.panel, Panel::default());
         assert!(Theme::parse("[font]\ntime_sizee = 40\n").is_err());
         assert!(Theme::parse("[panel]\nmaterial = \"glass\"\n").is_err());
+    }
+
+    #[test]
+    fn screen_overrides_and_beat_section() {
+        let t = Theme::parse(
+            "[display]\nlead_ms = 3\n[display.screens]\n\"DELL P2421D\" = 8\n[beat]\nstyle = \"ring\"\nvisual_lead_ms = -5\n",
+        )
+        .unwrap();
+        assert_eq!(t.display.lead_ms_for(Some("DELL P2421D")), 8.0);
+        assert_eq!(t.display.lead_ms_for(Some("Built-in")), 3.0);
+        assert_eq!(t.display.lead_ms_for(None), 3.0);
+        assert_eq!(t.beat.style, BeatStyle::Ring);
+        assert_eq!(t.beat.visual_lead(), (false, Duration::from_millis(5)));
+        assert_eq!(t.beat.sound().tick, Duration::from_millis(30));
+        assert!(Theme::parse("[beat]\nstyle = \"bounce\"\n").is_err());
     }
 }

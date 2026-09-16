@@ -19,10 +19,19 @@ dispatch2.workspace = true
 serde.workspace = true
 toml.workspace = true
 notify.workspace = true
+cpal.workspace = true
+
+[dependencies.objc2-core-audio]
+workspace = true
+features = ["AudioHardware"]
 
 [dependencies.objc2-core-foundation]
 workspace = true
 features = ["CFCGTypes"]
+
+[dependencies.objc2-core-graphics]
+workspace = true
+features = ["CGColor"]
 
 [dependencies.objc2-foundation]
 workspace = true
@@ -48,6 +57,7 @@ workspace = true
 features = [
     "CADisplayLink",
     "CAFrameRateRange",
+    "CAGradientLayer",
     "CALayer",
     "CAMediaTiming",
     "CATransaction",
@@ -58,6 +68,7 @@ features = [
 [dependencies.objc2-app-kit]
 workspace = true
 features = [
+    "NSAccessibility",
     "NSAppearance",
     "NSApplication",
     "NSAttributedString",
