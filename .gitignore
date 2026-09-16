@@ -1,0 +1,16 @@
+# Rust
+/target
+**/*.rs.bk
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+
+# Claude Code
+.claude/
+
+# 開發文檔（本地維護，不進版控）
+docs/dev/
