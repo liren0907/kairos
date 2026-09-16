@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ec2ecf2decaf8ba7e38e49d77491081bc27f68b7811b99684eaf53dcf2203217 # shrinks to sc = Scenario { theta0: 1700000000973000000, rho_ns_per_s: -29804.22646262281, samples: [(0.0, 0, 0, 7000000000), (0.0, 0, 0, 0), (0.0, 0, 0, 0), (0.0, 0, 0, 0), (0.0, 0, 0, 6000000000), (618.3900327885865, 0, 1842, 0), (618.4662677976522, 0, 1142, 0), (738.197704893706, 0, 1480, 0), (866.8901170414908, 0, 0, -3000000000), (889.2380231577591, 0, 11613153, 0), (976.0127671149555, 78976755, 40245029, 0), (1055.3160118502963, 91642903, 97611292, 0), (1365.9074380318361, 23057953, 63964872, 0)] }

@@ -7,6 +7,9 @@
 //! 估計器是純函數式的狀態機：沒有執行緒、沒有時鐘、沒有網路，
 //! 所以可以用合成樣本做性質測試，確認真值永遠落在回報的區間內。
 
+pub mod interval;
+pub mod lp2;
+
 use crate::model::ClockModel;
 use crate::source::Sample;
 use crate::time::HostTime;

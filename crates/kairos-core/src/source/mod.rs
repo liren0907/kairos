@@ -9,6 +9,10 @@
 //! 減去遠端處理時間。t₄ 取核心接收時間戳記（與 `mach_absolute_time` 同基準，
 //! 已由 spike 驗證）；t₁ 只能在 `sendto` 前於使用者空間讀，區間因此略寬，但仍安全。
 
+pub mod client;
+pub mod ntp;
+pub mod udp;
+
 use crate::model::SourceKind;
 use crate::time::HostTime;
 
