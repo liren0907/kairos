@@ -98,13 +98,13 @@ pub enum Action {
 pub struct TargetMachine {
     config: TargetConfig,
     stage: Stage,
-    /// 鎖定至少要在歸零前這麼久：畫面提早一拍起跑，加上音訊暖機。
+    /// 鎖定至少要在歸零前這麼久：畫面起跑所需的時間，加上音訊暖機。
     min_lock_margin: Duration,
 }
 
 impl TargetMachine {
-    /// `min_lock_margin` 由 app 依拍數與拍距算：`period × ticks + 0.5 s`。
-    /// `lock_before` 至少會比它多一秒。
+    /// `min_lock_margin` 由 app 依拍點表算：畫面起跑比歸零早多久，加 0.5 秒。
+    /// `lock_before` 至少會比它多一秒；`measure_before` 不會早於 `lock_before`。
     pub fn new(mut config: TargetConfig, min_lock_margin: Duration) -> TargetMachine {
         config.lock_before = config
             .lock_before

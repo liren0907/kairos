@@ -198,6 +198,14 @@ impl BeatStrip {
         }
     }
 
+    /// 起跑前不想看到靜止的球就整個藏起來。
+    pub fn set_hidden(&self, hidden: bool) {
+        self.a.setHidden(hidden);
+        if let Some(b) = &self.b {
+            b.setHidden(hidden);
+        }
+    }
+
     /// 呼叫端要包在關掉隱式動畫的 `CATransaction` 裡。
     pub fn render(&mut self, p: &Phase) {
         if p.is_final != self.showing_final {

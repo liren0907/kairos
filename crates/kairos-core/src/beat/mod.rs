@@ -1,9 +1,9 @@
 //! 拍點：把「標準時間的某一刻」換成以主機時間表示的拍點表，畫面、聲音、光暈共用同一份，
 //! 三者天生對齊，因為根本沒有第二份時間。
 //!
-//! 一份 [`BeatPlan`] 只有三個數：歸零時刻、拍距、拍數。拍點在 `zero − k·period`；
-//! 畫面比第一拍早一個拍距起跑（球要有整段軌跡才落地）；歸零後留一段收尾期，
-//! 讓落地的閃光與光暈衰減完。
+//! 一份 [`BeatPlan`] 的骨幹是三個數：歸零時刻、拍距、拍數。拍點在 `zero − k·period`；
+//! 畫面比第一聲早 `lead_beats` 個拍距起跑（至少一拍，球要有整段軌跡才落地；想更早就多幾拍
+//! 無聲的落地），歸零後留一段收尾期 `tail`，讓落地的閃光與光暈衰減完。
 //!
 //! 子模組 [`audio`] 是滴答聲的取樣渲染，[`visual`] 是節拍元件的幾何函數；
 //! 兩者都是純函數，不碰任何框架。
@@ -16,10 +16,12 @@ use std::time::Duration;
 use crate::model::ClockModel;
 use crate::time::HostTime;
 
-/// 歸零後的收尾期：閃光與光暈在這段時間內衰減完，之後 [`BeatPlan::phase_at`] 回 `None`。
-pub const TAIL: Duration = Duration::from_millis(1500);
+/// 預設的收尾期：閃光與光暈在這段時間內衰減完，之後 [`BeatPlan::phase_at`] 回 `None`。
+pub const DEFAULT_TAIL: Duration = Duration::from_millis(1500);
 /// 拍數上限：聲音渲染用 `u32` 位元遮罩回報「這個緩衝區裡有哪些拍起音」。
 pub const MAX_TICKS: u32 = 32;
+/// 畫面起跑最早在歸零前多少拍：一小時的秒數，再多沒有意義。
+pub const MAX_LEAD_BEATS: u32 = 3600;
 
 /// 以主機時間表示的拍點表。值型別，排好就不再變。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,14 +30,18 @@ pub struct BeatPlan {
     pub zero: HostTime,
     /// 拍距。
     pub period: Duration,
-    /// 拍數，含歸零那一拍。
+    /// 有聲的拍數，含歸零那一拍。
     pub ticks: u32,
+    /// 畫面比第一聲早幾個拍距起跑，至少 1；多出來的那幾拍落地無聲。
+    pub lead_beats: u32,
+    /// 歸零後的收尾期。
+    pub tail: Duration,
 }
 
 /// 某一刻在拍點表裡的位置。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Phase {
-    /// 正在逼近（或剛落地）的拍，0 起算；`ticks − 1` 是歸零拍。
+    /// 正在逼近（或剛落地）的拍，0 起算、含無聲拍；[`BeatPlan::total_beats`]` − 1` 是歸零拍。
     pub beat: u32,
     /// 這一拍週期內的相位：0 剛起跑、趨近 1 落地。歸零後固定為 1。
     pub phi: f64,
@@ -53,7 +59,7 @@ impl Phase {
         Phase {
             beat: 0,
             phi: 0.0,
-            is_final: plan.ticks == 1,
+            is_final: plan.total_beats() == 1,
             since_landing: None,
             done: false,
         }
@@ -61,13 +67,55 @@ impl Phase {
 }
 
 impl BeatPlan {
-    /// 拍距至少 1 ms，拍數夾在 1 到 [`MAX_TICKS`]。
+    /// 拍距至少 1 ms，拍數夾在 1 到 [`MAX_TICKS`]；畫面提早一拍起跑、收尾 [`DEFAULT_TAIL`]。
     pub fn new(zero: HostTime, period: Duration, ticks: u32) -> BeatPlan {
         BeatPlan {
             zero,
             period: period.max(Duration::from_millis(1)),
             ticks: ticks.clamp(1, MAX_TICKS),
+            lead_beats: 1,
+            tail: DEFAULT_TAIL,
         }
+    }
+
+    /// 畫面比第一聲早 `lead_beats` 個拍距起跑（夾在 1 到 [`MAX_LEAD_BEATS`]）。
+    pub fn with_lead(mut self, lead_beats: u32) -> BeatPlan {
+        self.lead_beats = lead_beats.clamp(1, MAX_LEAD_BEATS);
+        self
+    }
+
+    pub fn with_tail(mut self, tail: Duration) -> BeatPlan {
+        self.tail = tail;
+        self
+    }
+
+    /// 要讓畫面至少在歸零前 `lead` 起跑，第一聲前得留幾拍：往前取整到整拍，至少 1。
+    /// 例：拍距 1 秒、4 拍、要 9.3 秒 → 共 10 拍 → 第一聲前 7 拍。
+    pub fn lead_beats_for(lead: Duration, period: Duration, ticks: u32) -> u32 {
+        let period = period.max(Duration::from_millis(1));
+        let ticks = ticks.clamp(1, MAX_TICKS);
+        let total = (lead.as_secs_f64() / period.as_secs_f64()).ceil();
+        let total = if total.is_finite() {
+            total.clamp(0.0, (MAX_LEAD_BEATS + ticks) as f64) as u32
+        } else {
+            0
+        };
+        (total + 1).saturating_sub(ticks).clamp(1, MAX_LEAD_BEATS)
+    }
+
+    /// 畫面上總共幾拍：無聲的前導拍加有聲拍（第一聲那一拍算在有聲裡）。
+    pub fn total_beats(&self) -> u32 {
+        self.ticks - 1 + self.lead_beats
+    }
+
+    /// 畫面起跑比歸零早多久。
+    pub fn visual_lead(&self) -> Duration {
+        self.period * self.total_beats()
+    }
+
+    /// 落地無聲的次數：前 `lead_beats − 1` 次落地沒有聲音。
+    pub fn silent_landings(&self) -> u32 {
+        self.lead_beats - 1
     }
 
     /// 以模型把遠端時刻反解成主機時刻當歸零點。之後模型再更新也不影響這份表。
@@ -90,14 +138,14 @@ impl BeatPlan {
         self.tick_at(0)
     }
 
-    /// 畫面起跑：第一拍前一個拍距。
+    /// 畫面起跑：第一聲前 `lead_beats` 個拍距。
     pub fn visual_start(&self) -> HostTime {
-        self.zero - self.period * self.ticks
+        self.zero - self.visual_lead()
     }
 
     /// 收尾期結束，整個節拍程序到此為止。
     pub fn end(&self) -> HostTime {
-        self.zero + TAIL
+        self.zero + self.tail
     }
 
     pub fn tick_times(&self) -> impl Iterator<Item = (u32, HostTime)> + '_ {
@@ -110,9 +158,10 @@ impl BeatPlan {
         if at < start || at >= self.end() {
             return None;
         }
+        let total = self.total_beats();
         if at >= self.zero {
             return Some(Phase {
-                beat: self.ticks - 1,
+                beat: total - 1,
                 phi: 1.0,
                 is_final: true,
                 since_landing: Some(at - self.zero),
@@ -121,12 +170,12 @@ impl BeatPlan {
         }
         let elapsed = (at - start).as_nanos();
         let period = self.period.as_nanos();
-        let k = ((elapsed / period) as u32).min(self.ticks - 1);
+        let k = ((elapsed / period) as u32).min(total - 1);
         let into = elapsed - k as u128 * period;
         Some(Phase {
             beat: k,
             phi: (into as f64 / period as f64).clamp(0.0, 1.0),
-            is_final: k == self.ticks - 1,
+            is_final: k == total - 1,
             since_landing: (k > 0).then(|| Duration::from_nanos(into as u64)),
             done: false,
         })
@@ -204,6 +253,58 @@ mod tests {
         let tail = p.phase_at(p.zero + Duration::from_millis(1_499)).unwrap();
         assert!(tail.done);
         assert_eq!(p.phase_at(p.end()), None);
+    }
+
+    #[test]
+    fn lead_beats_push_the_visual_start_earlier_and_land_silently() {
+        let p = plan().with_lead(3).with_tail(Duration::from_millis(500));
+        let z = ns(p.zero);
+        assert_eq!(p.total_beats(), 6);
+        assert_eq!(p.silent_landings(), 2);
+        assert_eq!(p.visual_lead(), Duration::from_secs(6));
+        assert!((ns(p.visual_start()) - (z - 6_000_000_000)).abs() <= 50);
+        assert!((ns(p.end()) - (z + 500_000_000)).abs() <= 50);
+        // 有聲拍不受影響。
+        assert!((ns(p.first_tick()) - (z - 3_000_000_000)).abs() <= 50);
+        assert_eq!(p.tick_times().count(), 4);
+
+        // 起跑後 2.5 秒：第 2 拍（0 起算）飛到一半，前兩次落地都無聲；第 2 拍落地就是第一聲。
+        let start = p.visual_start();
+        let mid = p.phase_at(start + Duration::from_millis(2_500)).unwrap();
+        assert_eq!(mid.beat, 2);
+        assert!((mid.phi - 0.5).abs() < 1e-6);
+        assert!(!mid.is_final);
+        // 最後一拍是第 5 拍。
+        let near = p.phase_at(p.zero - Duration::from_millis(10)).unwrap();
+        assert_eq!(near.beat, 5);
+        assert!(near.is_final);
+        assert_eq!(p.phase_at(p.zero + Duration::from_millis(500)), None);
+        assert!(!Phase::idle(&p).is_final);
+    }
+
+    #[test]
+    fn lead_beats_for_rounds_up_to_whole_beats_and_never_below_one() {
+        let s = Duration::from_secs;
+        let one = Duration::from_secs(1);
+        assert_eq!(BeatPlan::lead_beats_for(Duration::ZERO, one, 4), 1);
+        assert_eq!(BeatPlan::lead_beats_for(s(4), one, 4), 1);
+        assert_eq!(
+            BeatPlan::lead_beats_for(Duration::from_millis(4_001), one, 4),
+            2
+        );
+        assert_eq!(
+            BeatPlan::lead_beats_for(Duration::from_millis(9_300), one, 4),
+            7
+        );
+        assert_eq!(BeatPlan::lead_beats_for(s(2), one, 4), 1);
+        // 拍距 500 ms、1 拍、要 3 秒 → 共 6 拍 → 第一聲前 6 拍。
+        assert_eq!(
+            BeatPlan::lead_beats_for(s(3), Duration::from_millis(500), 1),
+            6
+        );
+        assert_eq!(BeatPlan::lead_beats_for(s(100_000), one, 4), MAX_LEAD_BEATS);
+        assert_eq!(plan().with_lead(0).lead_beats, 1);
+        assert_eq!(plan().with_lead(u32::MAX).lead_beats, MAX_LEAD_BEATS);
     }
 
     #[test]

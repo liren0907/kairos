@@ -19,10 +19,10 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSBitmapImageFileType, NSControlStateValueOff, NSControlStateValueOn, NSEvent, NSEventMask,
-    NSEventPhase, NSEventType, NSMenuItem, NSWindowDidChangeBackingPropertiesNotification,
-    NSWindowDidChangeScreenNotification, NSWindowDidEndLiveResizeNotification,
-    NSWindowDidResizeNotification, NSWorkspace,
+    NSBitmapImageFileType, NSButton, NSControlStateValueOff, NSControlStateValueOn, NSEvent,
+    NSEventMask, NSEventPhase, NSEventType, NSMenuItem,
+    NSWindowDidChangeBackingPropertiesNotification, NSWindowDidChangeScreenNotification,
+    NSWindowDidEndLiveResizeNotification, NSWindowDidResizeNotification, NSWorkspace,
 };
 use objc2_foundation::{
     NSDictionary, NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol, NSRunLoop,
@@ -36,7 +36,8 @@ use kairos_core::display::{DASHES, DisplaySmoother, LocalTime, SmootherConfig, l
 use kairos_core::model::ClockModel;
 use kairos_core::sync::SamplerHandle;
 use kairos_core::target::{
-    AbortReason, Action, CALIBRATION_ROUNDS, Stage, TargetConfig, TargetMachine,
+    AbortReason, Action, CALIBRATION_ROUNDS, DEFAULT_LOCK_BEFORE, DEFAULT_MEASURE_BEFORE, Stage,
+    TargetConfig, TargetMachine,
 };
 use kairos_core::time::{HostTime, system_theta_ns};
 
@@ -45,11 +46,12 @@ use crate::beat_view::StripKind;
 use crate::calibrate::CalibrationRun;
 use crate::glow::Glow;
 use crate::panel::{Face, PanelViews, build_panel};
-use crate::state_store::{ViewState, clamp_opacity, clamp_zoom};
+use crate::settings_panel::{SettingsPanel, TAB_BEAT, TAB_SOUND, TAB_TIMELINE};
+use crate::settings_store::{self, Settings, clamp_opacity, clamp_zoom};
 use crate::target_panel::TargetPanel;
 use crate::target_store::TargetFile;
 use crate::text::{self, ms, remaining_text, status_word, system_clock_text};
-use crate::theme::{self, BeatStyle, Theme};
+use crate::theme::{self, Beat, BeatStyle, Theme};
 
 /// 其他執行緒（檔案監看、通知）只能設旗標，主執行緒在下一格處理。
 #[derive(Default)]
@@ -88,8 +90,8 @@ impl Gestures {
 const THEME_RELOAD_DELAY: Duration = Duration::from_millis(150);
 /// 拖邊緣或捏合中最多多久重建一次面板。
 const ZOOM_REBUILD_INTERVAL: Duration = Duration::from_millis(50);
-/// 大小或不透明度改完後等這麼久沒再動才寫 state.toml。
-const STATE_SAVE_DELAY: Duration = Duration::from_millis(300);
+/// 設定（大小、不透明度、設定視窗）改完後等這麼久沒再動才寫 settings.toml。
+const SETTINGS_SAVE_DELAY: Duration = Duration::from_millis(300);
 /// 說明列暫時顯示「大小 125% · 不透明度 70%」多久。
 const TOAST_DURATION: Duration = Duration::from_millis(1500);
 /// 選單「放大／縮小」一次乘除多少。
@@ -104,8 +106,6 @@ const DIAG_FRAMES: usize = 300;
 /// 設了 `KAIROS_SNAPSHOT_DIR` 時，在這幾格把面板離屏渲染成 PNG（沒有毛玻璃，只有內容）；
 /// `KAIROS_SNAPSHOT_FRAMES="120,600"` 可改格數。開發用：沒有螢幕錄製權限也能看到版面。
 const SNAPSHOT_FRAMES: &[u64] = &[120, 900];
-/// 試聽節拍：歸零訂在「現在＋這麼久」之後的下一個整秒。
-const DEMO_LEAD: Duration = Duration::from_secs(5);
 /// 第一拍離現在至少要這麼久，音訊串流才來得及暖機。
 const MIN_LEAD: Duration = Duration::from_millis(500);
 
@@ -258,16 +258,20 @@ struct State {
     beat: RefCell<Option<BeatSession>>,
     sound_on: Cell<bool>,
     glow_on: Cell<bool>,
-    /// 選單「節拍樣式」的選擇：`None` 依主題檔；主題檔的 `style` 一改就清掉（最後一次動作為準）。
-    style_override: Cell<Option<StripKind>>,
-    /// 面板外觀：大小倍率與不透明度指定（`None` 依主題檔），記在 `state.toml`。
-    state_path: PathBuf,
+    /// 主題檔原樣（只讀）；`theme` 是蓋上設定的覆寫後的有效主題。
+    base_theme: RefCell<Theme>,
+    /// 設定視窗、選單、滾輪改過、跟主題檔不一樣的鍵，記在 `settings.toml` 的 `[theme]`。
+    overrides: RefCell<toml::Table>,
+    settings_path: PathBuf,
+    settings_panel: RefCell<Option<SettingsPanel>>,
+    /// 開發用：設了 `KAIROS_SHOW_SETTINGS` 就在啟動半秒後打開設定視窗（給快照看版面）。
+    settings_pending: Cell<bool>,
+    /// 面板的大小倍率，記在 `settings.toml` 的 `zoom`。
     zoom: Cell<f64>,
-    opacity_override: Cell<Option<f64>>,
     /// 拖邊緣或捏合中還沒套用的倍率；每 `ZOOM_REBUILD_INTERVAL` 最多重建一次。
     zoom_pending: Cell<Option<f64>>,
     zoom_rebuilt_at: Cell<Option<HostTime>>,
-    state_dirty_since: Cell<Option<HostTime>>,
+    settings_dirty_since: Cell<Option<HostTime>>,
     /// 說明列暫時顯示的文字與開始時刻。
     toast: RefCell<Option<(String, HostTime)>>,
     gestures: Rc<Gestures>,
@@ -374,22 +378,54 @@ define_class!(
 
         #[unsafe(method(moreTransparent:))]
         fn more_transparent_action(&self, _sender: Option<&AnyObject>) {
-            self.set_opacity_override(Some(self.effective_opacity() - OPACITY_STEP));
+            self.set_opacity(Some(self.effective_opacity() - OPACITY_STEP));
         }
 
         #[unsafe(method(lessTransparent:))]
         fn less_transparent_action(&self, _sender: Option<&AnyObject>) {
-            self.set_opacity_override(Some(self.effective_opacity() + OPACITY_STEP));
+            self.set_opacity(Some(self.effective_opacity() + OPACITY_STEP));
         }
 
         #[unsafe(method(resetOpacity:))]
         fn reset_opacity_action(&self, _sender: Option<&AnyObject>) {
-            self.set_opacity_override(None);
+            self.set_opacity(None);
         }
 
         #[unsafe(method(showTargetPanel:))]
         fn show_target_panel_action(&self, _sender: Option<&AnyObject>) {
             self.show_target_panel();
+        }
+
+        #[unsafe(method(showSettings:))]
+        fn show_settings_action(&self, _sender: Option<&AnyObject>) {
+            self.show_settings();
+        }
+
+        /// 設定視窗的任何控制項一動都來這裡。
+        #[unsafe(method(settingChanged:))]
+        fn setting_changed_action(&self, _sender: Option<&AnyObject>) {
+            self.setting_changed();
+        }
+
+        /// 步進器：先把值寫回它的文字欄，再當一般改動處理。
+        #[unsafe(method(stepperChanged:))]
+        fn stepper_changed_action(&self, sender: Option<&AnyObject>) {
+            if let Some(sender) = sender
+                && let Some(p) = self.state().settings_panel.borrow().as_ref()
+            {
+                p.sync_stepper(sender);
+            }
+            self.setting_changed();
+        }
+
+        /// 每頁的「回復預設值」，靠 `tag` 分頁。
+        #[unsafe(method(resetSettingsTab:))]
+        fn reset_settings_tab_action(&self, sender: Option<&AnyObject>) {
+            let tag = sender
+                .and_then(|s| s.downcast_ref::<NSButton>())
+                .map(|b| b.tag())
+                .unwrap_or(-1);
+            self.reset_settings_tab(tag);
         }
 
         #[unsafe(method(applyTarget:))]
@@ -424,24 +460,20 @@ impl Controller {
         &self.ivars().state
     }
 
-    /// `theme` 由 main 先讀好（取樣執行緒的設定也從它來），這裡只接手。
+    /// `base` 是主題檔原樣、`theme` 是蓋上 `settings` 的覆寫後的有效主題，都由 main 先算好
+    /// （取樣執行緒的設定也從有效主題來），這裡只接手。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mtm: MainThreadMarker,
         sampler: SamplerHandle,
+        base: Theme,
         theme: Theme,
+        settings: Settings,
         theme_path: PathBuf,
         store_path: PathBuf,
-        state_path: PathBuf,
+        settings_path: PathBuf,
     ) -> Retained<Self> {
         let views = build_panel(mtm, &theme);
-        let view_state = ViewState::load(&state_path);
-        if view_state != ViewState::default() {
-            eprintln!(
-                "外觀：{}（來自 {}）",
-                view_state.describe(theme.panel.opacity),
-                state_path.display()
-            );
-        }
         let flags = Arc::new(Flags::default());
         let watcher = {
             let flags = flags.clone();
@@ -504,13 +536,15 @@ impl Controller {
             beat: RefCell::new(None),
             sound_on: Cell::new(true),
             glow_on: Cell::new(true),
-            style_override: Cell::new(None),
-            state_path,
-            zoom: Cell::new(view_state.zoom),
-            opacity_override: Cell::new(view_state.opacity),
+            base_theme: RefCell::new(base),
+            overrides: RefCell::new(settings.theme),
+            settings_path,
+            settings_panel: RefCell::new(None),
+            settings_pending: Cell::new(std::env::var_os("KAIROS_SHOW_SETTINGS").is_some()),
+            zoom: Cell::new(settings.zoom),
             zoom_pending: Cell::new(None),
             zoom_rebuilt_at: Cell::new(None),
-            state_dirty_since: Cell::new(None),
+            settings_dirty_since: Cell::new(None),
             toast: RefCell::new(None),
             gestures: Rc::new(Gestures::new()),
             _gesture_monitor: RefCell::new(None),
@@ -538,6 +572,7 @@ impl Controller {
     pub fn set_menu_items(&self, items: MenuItems) {
         *self.state().menu.borrow_mut() = Some(items);
         self.refresh_menu();
+        self.refresh_style_menu();
     }
 
     /// 建立顯示連結、訂閱螢幕縮放與換螢幕的通知、把面板秀出來。
@@ -742,76 +777,175 @@ impl Controller {
         }
     }
 
-    /// 重讀主題檔。`verbose` 時連「沒變」也回報（選單手動觸發用）。
+    /// 重讀主題檔、蓋上設定的覆寫、套用差異。`verbose` 時連「沒變」也回報（選單手動觸發用）。
+    /// 設定視窗改東西不走這裡（見 `commit_theme`），但倒數期間延後的改動會在倒數結束後從這裡補套。
     pub fn reload_theme(&self, verbose: bool) {
         let iv = self.state();
-        match std::fs::read_to_string(&iv.theme_path)
+        let new_base = match std::fs::read_to_string(&iv.theme_path)
             .map_err(|e| e.to_string())
             .and_then(|t| Theme::parse(&t).map_err(|e| e.to_string()))
         {
-            Ok(new) => {
-                if *iv.theme.borrow() == new {
-                    if verbose {
-                        eprintln!("主題：沒有變動");
-                    }
-                    return;
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "主題：{} 讀取失敗，沿用上一版：{e}",
+                    iv.theme_path.display()
+                );
+                return;
+            }
+        };
+        let base_changed = *iv.base_theme.borrow() != new_base;
+        if base_changed {
+            // 最後一次動作為準：主題檔改了哪些鍵，設定裡那些鍵的覆寫就作廢。
+            let removed = settings_store::prune(
+                &mut iv.overrides.borrow_mut(),
+                &iv.base_theme.borrow().to_table(),
+                &new_base.to_table(),
+            );
+            *iv.base_theme.borrow_mut() = new_base;
+            if !removed.is_empty() {
+                eprintln!(
+                    "主題：{} 有變，設定裡這些鍵的覆寫作廢，回到依主題檔",
+                    removed.join("、")
+                );
+                self.mark_settings_dirty();
+            }
+        }
+        let effective =
+            match settings_store::effective(&iv.base_theme.borrow(), &iv.overrides.borrow()) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("設定：[theme] 的覆寫套不上（{e}），這次全部作廢");
+                    iv.overrides.borrow_mut().clear();
+                    self.mark_settings_dirty();
+                    iv.base_theme.borrow().clone()
                 }
-                let sync_changed = iv.theme.borrow().sync != new.sync;
-                let style_changed = iv.theme.borrow().beat.style != new.beat.style;
-                let opacity_changed = iv.theme.borrow().panel.opacity != new.panel.opacity;
-                *iv.theme.borrow_mut() = new;
-                if opacity_changed && iv.opacity_override.replace(None).is_some() {
-                    // 最後一次動作為準：主題檔改了不透明度，滾輪或選單的指定就作廢。
-                    eprintln!("主題：[panel] opacity 有變，不透明度的指定作廢，回到依主題檔");
-                    self.mark_state_dirty();
+            };
+        if effective == *iv.theme.borrow() {
+            if verbose {
+                eprintln!("主題：沒有變動");
+            }
+            return;
+        }
+        self.apply_theme_change(effective, if base_changed { "主題" } else { "設定" });
+        if base_changed {
+            eprintln!("主題：已重新載入 {}", iv.theme_path.display());
+        }
+    }
+
+    /// 設定視窗、選單、滾輪改了有效主題：算出跟主題檔的差當覆寫、記下來、套用。
+    /// 差是對「現在」算的，再疊到「主題檔＋既有覆寫」上，所以倒數期間延後套用的改動不會被蓋掉。
+    fn commit_theme(&self, new: Theme, who: &str) {
+        let iv = self.state();
+        let base_table = iv.base_theme.borrow().to_table();
+        let delta = settings_store::diff(&iv.theme.borrow().to_table(), &new.to_table());
+        let pending = settings_store::merge(
+            &settings_store::merge(&base_table, &iv.overrides.borrow()),
+            &delta,
+        );
+        let overrides = settings_store::diff(&base_table, &pending);
+        let effective = match Theme::from_table(pending) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("{who}：改動套不上（{e}），不動");
+                return;
+            }
+        };
+        *iv.overrides.borrow_mut() = overrides;
+        self.mark_settings_dirty();
+        self.apply_theme_change(effective, who);
+    }
+
+    /// 換上一份新的有效主題，只動有變的部分。倒數期間只套不透明度，其餘留旗標等倒數結束再補。
+    fn apply_theme_change(&self, new: Theme, who: &str) {
+        let iv = self.state();
+        let old = iv.theme.borrow().clone();
+        let opacity_changed = old.panel.opacity != new.panel.opacity;
+        if self.session_purpose() == Some(Purpose::Countdown) {
+            if opacity_changed {
+                iv.theme.borrow_mut().panel.opacity = new.panel.opacity;
+                iv.views.set_opacity(new.panel.opacity);
+                self.show_toast(self.describe_view());
+            }
+            let mut rest = new;
+            rest.panel.opacity = old.panel.opacity;
+            if rest != old {
+                iv.flags.theme_dirty.store(true, Ordering::SeqCst);
+                eprintln!("{who}：鎖定倒數中，除了不透明度以外的改動等倒數結束再套用");
+                self.set_settings_status("鎖定倒數中，其他改動等倒數結束再套用");
+            }
+            return;
+        }
+        let sync_changed = old.sync != new.sync;
+        let style_changed = old.beat.style != new.beat.style;
+        let display_changed = old.display != new.display;
+        let timeline_changed = old.beat.timeline() != new.beat.timeline()
+            || old.beat.demo_lead_s != new.beat.demo_lead_s;
+        let rebuild = needs_rebuild(&old, &new);
+        *iv.theme.borrow_mut() = new;
+
+        let mut retarget = false;
+        if style_changed {
+            let reduce_motion =
+                NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
+            let kind = self.resolve_kind(&iv.theme.borrow(), reduce_motion);
+            if let Some(session) = iv.beat.borrow_mut().as_mut()
+                && session.kind != kind
+            {
+                // 進行中的節拍也換過去；下面重建節拍區，Metal 的上屏統計從那一刻起重算。
+                session.kind = kind;
+                retarget = true;
+            }
+            self.refresh_style_menu();
+            eprintln!(
+                "{who}：節拍樣式改為{}{}",
+                kind.title(),
+                if retarget {
+                    "，進行中的節拍立刻換"
+                } else {
+                    ""
                 }
-                if style_changed {
-                    // 最後一次動作為準：主題檔改了樣式，選單的指定就作廢。
-                    let had_override = iv.style_override.replace(None).is_some();
-                    let reduce_motion =
-                        NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
-                    let kind = self.resolve_kind(&iv.theme.borrow(), reduce_motion);
-                    // 進行中的節拍也換過去；下面的 rebuild_face 會用新的 kind 重建節拍區。
-                    if let Some(session) = iv.beat.borrow_mut().as_mut() {
-                        session.kind = kind;
-                    }
-                    self.refresh_style_menu();
+            );
+        }
+        if opacity_changed {
+            iv.views.set_opacity(self.effective_opacity());
+            self.show_toast(self.describe_view());
+        }
+        if rebuild || retarget {
+            self.rebuild_face(false);
+        }
+        if display_changed {
+            self.refresh_screen(false);
+            if let Some(link) = iv.link.borrow().as_ref() {
+                self.apply_frame_rate(link);
+            }
+        }
+        if timeline_changed {
+            eprintln!(
+                "{who}：時間軸改為 {}",
+                iv.theme.borrow().beat.timeline().describe()
+            );
+            self.rearm_if_pending();
+        }
+        if sync_changed {
+            match iv.theme.borrow().sync.settings() {
+                Ok(s) => {
                     eprintln!(
-                        "主題：[beat] style 有變，節拍樣式改為{}{}",
-                        kind.title(),
-                        if had_override {
-                            "（選單的指定作廢，回到依主題檔）"
+                        "{who}：[sync] 有變，換成 {}{}",
+                        s.servers.join("、"),
+                        if iv.sampler.is_paused() {
+                            "（鎖定中，解凍後套用）"
                         } else {
                             ""
                         }
                     );
+                    iv.sampler.reconfigure(s);
                 }
-                self.rebuild_face(false);
-                self.refresh_screen(false);
-                eprintln!("主題：已重新載入 {}", iv.theme_path.display());
-                if sync_changed {
-                    match iv.theme.borrow().sync.settings() {
-                        Ok(s) => {
-                            eprintln!(
-                                "主題：[sync] 有變，換成 {}{}",
-                                s.servers.join("、"),
-                                if iv.sampler.is_paused() {
-                                    "（鎖定中，解凍後套用）"
-                                } else {
-                                    ""
-                                }
-                            );
-                            iv.sampler.reconfigure(s);
-                        }
-                        Err(e) => eprintln!("主題：[sync] 不合法（{e}），時間來源沿用上一版"),
-                    }
-                }
+                Err(e) => eprintln!("{who}：[sync] 不合法（{e}），時間來源沿用上一版"),
             }
-            Err(e) => eprintln!(
-                "主題：{} 讀取失敗，沿用上一版：{e}",
-                iv.theme_path.display()
-            ),
         }
+        self.refresh_menu();
+        self.refresh_settings_panel();
     }
 
     pub fn toggle_panel(&self) {
@@ -851,8 +985,8 @@ impl Controller {
 
     // ---------- 節拍程序 ----------
 
-    /// 試聽：歸零訂在「現在＋5 秒」之後的下一個標準時間整秒，歸零拍會跟數字翻到 `.000`
-    /// 同一瞬間，光看面板就能驗證球落地與翻頁是不是同一刻。
+    /// 試聽：歸零訂在「現在＋試聽提前（`demo_lead_s`，不夠畫面起跑就拉長）」之後的下一個
+    /// 標準時間整秒，歸零拍會跟數字翻到 `.000` 同一瞬間，光看面板就能驗證球落地與翻頁是不是同一刻。
     pub fn start_demo_beats(&self) {
         let iv = self.state();
         let model = iv.sampler.model();
@@ -863,7 +997,19 @@ impl Controller {
             );
             return;
         }
-        let target = next_whole_second(&model, HostTime::now() + DEMO_LEAD);
+        let (demo_lead, needed) = {
+            let b = &iv.theme.borrow().beat;
+            (b.demo_lead(), b.timeline().visual_lead + MIN_LEAD)
+        };
+        let lead = demo_lead.max(needed);
+        if lead > demo_lead {
+            eprintln!(
+                "節拍：試聽提前 {:.0} 秒不夠畫面起跑，改成 {:.1} 秒後歸零",
+                demo_lead.as_secs_f64(),
+                lead.as_secs_f64()
+            );
+        }
+        let target = next_whole_second(&model, HostTime::now() + lead);
         self.start_beats(target);
     }
 
@@ -875,14 +1021,11 @@ impl Controller {
             eprintln!("節拍：標準時間模型還不能用，無法排程");
             return false;
         }
-        let theme = iv.theme.borrow();
-        let plan = BeatPlan::from_target(
-            &model,
-            target_remote_unix_ns,
-            theme.beat.period(),
-            theme.beat.ticks,
-        );
-        drop(theme);
+        let plan = iv
+            .theme
+            .borrow()
+            .beat
+            .plan(model.host_at(target_remote_unix_ns));
         self.start_plan(plan, Purpose::Demo)
     }
 
@@ -935,14 +1078,20 @@ impl Controller {
             }
         };
         let summary = format!(
-            "節拍（{}）：歸零於本地時間 {zero_local}（{:.3} 秒後），{} 拍、拍距 {} ms、樣式 {}{}、聲音{}、光暈 {} 個螢幕、刷新率 {:.0} Hz{}{}",
+            "節拍（{}）：歸零於本地時間 {zero_local}（{:.3} 秒後），{} 拍、拍距 {} ms、畫面歸零前 {:.1} 秒起跑（共 {} 拍{}）、樣式 {}{}、聲音{}、光暈 {} 個螢幕、刷新率 {:.0} Hz{}{}",
             purpose.label(),
             plan.zero.saturating_duration_since(now).as_secs_f64(),
             plan.ticks,
             theme.beat.period_ms,
+            plan.visual_lead().as_secs_f64(),
+            plan.total_beats(),
+            match plan.silent_landings() {
+                0 => String::new(),
+                n => format!("，前 {n} 次落地無聲"),
+            },
             kind.title(),
-            if iv.style_override.get().is_some() {
-                "（選單指定）"
+            if settings_store::has_leaf(&iv.overrides.borrow(), "beat.style") {
+                "（設定指定）"
             } else {
                 ""
             },
@@ -1076,11 +1225,15 @@ impl Controller {
         if let Some(menu) = iv.menu.borrow().as_ref() {
             let active = iv.beat.borrow().is_some();
             menu.beat_stop.setEnabled(active);
-            menu.beat_start.setTitle(&NSString::from_str(if active {
-                "重新排節拍（5 秒後）"
-            } else {
-                "試聽節拍（5 秒後）"
-            }));
+            let secs = iv.theme.borrow().beat.demo_lead().as_secs_f64();
+            menu.beat_start.setTitle(&NSString::from_str(&format!(
+                "{}（{secs:.0} 秒後）",
+                if active {
+                    "重新排節拍"
+                } else {
+                    "試聽節拍"
+                }
+            )));
             menu.clear_target.setEnabled(iv.target.borrow().is_some());
         }
     }
@@ -1140,11 +1293,8 @@ impl Controller {
         eprintln!("邊緣光暈：{}", if on { "開" } else { "關" });
     }
 
-    /// 這一次節拍區該畫什麼：選單有指定就照選單，否則照主題檔（`auto` 看「減少動態效果」）。
+    /// 這一次節拍區該畫什麼：照有效主題的 `style`（`auto` 看「減少動態效果」）。
     fn resolve_kind(&self, theme: &Theme, reduce_motion: bool) -> StripKind {
-        if let Some(kind) = self.state().style_override.get() {
-            return kind;
-        }
         match theme.beat.style {
             BeatStyle::Auto if reduce_motion => StripKind::Pulse,
             BeatStyle::Auto | BeatStyle::Ball => StripKind::Ball,
@@ -1153,50 +1303,37 @@ impl Controller {
         }
     }
 
-    /// 選單「節拍樣式」：`None` 回到依主題檔。程序進行中切換會立刻重建節拍區
-    /// （Metal 的上屏統計從那一刻起重算），沒在跑就下一次節拍起生效。
+    /// 選單「節拍樣式」：改的是有效主題的 `[beat] style`，跟設定視窗同一份覆寫、會記住；
+    /// `None` 回到依主題檔。程序進行中切換會立刻重建節拍區（Metal 的上屏統計從那一刻起重算）。
     pub fn set_beat_style(&self, choice: Option<StripKind>) {
         let iv = self.state();
-        iv.style_override.set(choice);
-        self.refresh_style_menu();
-        let reduce_motion = NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
-        let kind = self.resolve_kind(&iv.theme.borrow(), reduce_motion);
-        let mut what = match choice {
-            Some(k) => format!("節拍樣式：{}（選單指定）", k.title()),
-            None => format!("節拍樣式：依主題檔（目前是{}）", kind.title()),
+        let mut t = iv.theme.borrow().clone();
+        t.beat.style = match choice {
+            None => iv.base_theme.borrow().beat.style,
+            Some(StripKind::Ball) => BeatStyle::Ball,
+            Some(StripKind::Ring) => BeatStyle::Ring,
+            Some(StripKind::Pulse) => BeatStyle::Pulse,
         };
-        what.push_str(if self.retarget_running_strip(kind) {
-            "，進行中的節拍立刻換，上屏統計從現在起重算"
-        } else {
-            "，下一次節拍起生效"
-        });
-        eprintln!("{what}");
-    }
-
-    /// 有節拍在跑、而且樣式跟現在畫的不同，就換掉並重建面板；回傳有沒有真的重建。
-    fn retarget_running_strip(&self, kind: StripKind) -> bool {
-        let iv = self.state();
-        let changed = {
-            let mut beat = iv.beat.borrow_mut();
-            match beat.as_mut() {
-                Some(session) if session.kind != kind => {
-                    session.kind = kind;
-                    true
-                }
-                _ => false,
-            }
-        };
-        if changed {
-            self.rebuild_face(true);
+        if t == *iv.theme.borrow() {
+            eprintln!("節拍樣式：沒有變（已經是這個）");
+            self.refresh_style_menu();
+            return;
         }
-        changed
+        self.commit_theme(t, "節拍樣式");
     }
 
-    /// 讓「節拍樣式」子選單只勾目前的選擇。
+    /// 讓「節拍樣式」子選單只勾目前的選擇：設定有指定就勾那個樣式，否則勾「依主題檔」。
     fn refresh_style_menu(&self) {
         let iv = self.state();
         if let Some(menu) = iv.menu.borrow().as_ref() {
-            let current = iv.style_override.get();
+            let overridden = settings_store::has_leaf(&iv.overrides.borrow(), "beat.style");
+            let current = match iv.theme.borrow().beat.style {
+                _ if !overridden => None,
+                BeatStyle::Ball => Some(StripKind::Ball),
+                BeatStyle::Ring => Some(StripKind::Ring),
+                BeatStyle::Pulse => Some(StripKind::Pulse),
+                BeatStyle::Auto => None,
+            };
             for (choice, item) in &menu.style {
                 item.setState(if *choice == current {
                     NSControlStateValueOn
@@ -1209,25 +1346,26 @@ impl Controller {
 
     // ---------- 外觀：大小與不透明度 ----------
 
-    fn view_state(&self) -> ViewState {
+    fn settings(&self) -> Settings {
         let iv = self.state();
-        ViewState {
+        Settings {
             zoom: iv.zoom.get(),
-            opacity: iv.opacity_override.get(),
+            theme: iv.overrides.borrow().clone(),
         }
     }
 
-    /// 現在該套的不透明度：有指定就指定，否則主題檔。
+    /// 現在該套的不透明度：有效主題的值（設定改過就是設定的，否則主題檔的）。
     fn effective_opacity(&self) -> f64 {
-        let iv = self.state();
-        iv.opacity_override
-            .get()
-            .unwrap_or_else(|| iv.theme.borrow().panel.opacity)
+        self.state().theme.borrow().panel.opacity
     }
 
     fn describe_view(&self) -> String {
-        let theme_opacity = self.state().theme.borrow().panel.opacity;
-        self.view_state().describe(theme_opacity)
+        let iv = self.state();
+        settings_store::describe_view(
+            iv.zoom.get(),
+            self.effective_opacity(),
+            settings_store::has_leaf(&iv.overrides.borrow(), "panel.opacity"),
+        )
     }
 
     /// 說明列暫時顯示一句話，蓋過平常的「標準時間（NTP）· …」。
@@ -1235,8 +1373,8 @@ impl Controller {
         *self.state().toast.borrow_mut() = Some((text, HostTime::now()));
     }
 
-    fn mark_state_dirty(&self) {
-        self.state().state_dirty_since.set(Some(HostTime::now()));
+    fn mark_settings_dirty(&self) {
+        self.state().settings_dirty_since.set(Some(HostTime::now()));
     }
 
     /// 選單或程式指定倍率；拖邊緣與捏合走 `zoom_pending`。鎖定倒數期間不改。
@@ -1250,13 +1388,20 @@ impl Controller {
         self.service_zoom(true);
     }
 
-    /// 不透明度：`None` 回到依主題檔。只是一行 alpha，節拍與鎖定期間都照改。
-    pub fn set_opacity_override(&self, opacity: Option<f64>) {
+    /// 不透明度：改的是有效主題的 `[panel] opacity`（記進設定）；`None` 回到依主題檔。
+    /// 只是一行 alpha，節拍與鎖定期間都照改。
+    pub fn set_opacity(&self, opacity: Option<f64>) {
         let iv = self.state();
-        iv.opacity_override.set(opacity.map(clamp_opacity));
-        iv.views.set_opacity(self.effective_opacity());
-        self.show_toast(self.describe_view());
-        self.mark_state_dirty();
+        let mut t = iv.theme.borrow().clone();
+        t.panel.opacity = match opacity {
+            Some(o) => clamp_opacity(o),
+            None => iv.base_theme.borrow().panel.opacity,
+        };
+        if t == *iv.theme.borrow() {
+            self.show_toast(self.describe_view());
+            return;
+        }
+        self.commit_theme(t, "外觀");
     }
 
     /// 把累加的滾動量換成不透明度、捏合量換成待套用的倍率。
@@ -1266,7 +1411,7 @@ impl Controller {
         let lines = iv.gestures.scroll_lines.replace(0.0);
         let delta = points * OPACITY_PER_SCROLL_POINT + lines * OPACITY_PER_SCROLL_LINE;
         if delta != 0.0 {
-            self.set_opacity_override(Some(self.effective_opacity() + delta));
+            self.set_opacity(Some(self.effective_opacity() + delta));
         }
         let magnify = iv.gestures.magnify.replace(1.0);
         if magnify != 1.0 {
@@ -1312,23 +1457,151 @@ impl Controller {
                 }
             }
             iv.views.constrain_to_screen();
-            self.mark_state_dirty();
+            self.mark_settings_dirty();
         }
     }
 
-    /// 大小或不透明度改完、沒再動 `STATE_SAVE_DELAY` 後寫 state.toml。
-    fn service_state_save(&self) {
+    /// 設定改完、沒再動 `SETTINGS_SAVE_DELAY` 後寫 settings.toml。
+    fn service_settings_save(&self) {
         let iv = self.state();
-        let Some(since) = iv.state_dirty_since.get() else {
+        let Some(since) = iv.settings_dirty_since.get() else {
             return;
         };
-        if since.elapsed() < STATE_SAVE_DELAY {
+        if since.elapsed() < SETTINGS_SAVE_DELAY {
             return;
         }
-        iv.state_dirty_since.set(None);
-        match self.view_state().save(&iv.state_path) {
-            Ok(()) => eprintln!("外觀：{}，已記在 state.toml", self.describe_view()),
-            Err(e) => eprintln!("外觀：{} 寫入失敗：{e}", iv.state_path.display()),
+        iv.settings_dirty_since.set(None);
+        let settings = self.settings();
+        match settings.save(&iv.settings_path) {
+            Ok(()) => eprintln!(
+                "設定：已寫入 settings.toml（{}；{} 個覆寫：{}）",
+                self.describe_view(),
+                settings_store::leaf_count(&settings.theme),
+                settings_store::describe(&settings.theme)
+            ),
+            Err(e) => eprintln!("設定：{} 寫入失敗：{e}", iv.settings_path.display()),
+        }
+    }
+
+    // ---------- 設定視窗 ----------
+
+    pub fn show_settings(&self) {
+        let iv = self.state();
+        let mtm = self.mtm();
+        if iv.settings_panel.borrow().is_none() {
+            let target: &AnyObject = self;
+            *iv.settings_panel.borrow_mut() = Some(SettingsPanel::build(mtm, target));
+        }
+        self.refresh_settings_panel();
+        self.set_settings_status("改了就生效、自動記住；「回復預設值」回到主題檔的值");
+        if let Some(p) = iv.settings_panel.borrow().as_ref() {
+            p.show(mtm);
+        }
+    }
+
+    /// 用有效主題與目標檔填設定視窗（存在時），並更新時間軸那兩行。
+    fn refresh_settings_panel(&self) {
+        let iv = self.state();
+        let guard = iv.settings_panel.borrow();
+        let Some(p) = guard.as_ref() else { return };
+        let theme = iv.theme.borrow();
+        p.fill(&theme, &iv.store.borrow());
+        let margin = min_lock_margin(&theme);
+        p.set_timeline_info(&format!(
+            "畫面{}。鎖定至少要提前 {:.1} 秒（起跑加暖機再加 1 秒），填得更晚會自動提早。",
+            theme.beat.timeline().describe(),
+            margin.as_secs_f64() + 1.0
+        ));
+    }
+
+    fn set_settings_status(&self, text: &str) {
+        if let Some(p) = self.state().settings_panel.borrow().as_ref() {
+            p.set_status(text);
+        }
+    }
+
+    /// 設定視窗的控制項一動：整個視窗讀回來、套用、存檔。欄位不是數字就只顯示錯誤、什麼都不動。
+    fn setting_changed(&self) {
+        let iv = self.state();
+        let mut theme = iv.theme.borrow().clone();
+        let mut store = iv.store.borrow().clone();
+        {
+            let guard = iv.settings_panel.borrow();
+            let Some(p) = guard.as_ref() else { return };
+            if let Err(e) = p.read(&mut theme, &mut store) {
+                p.set_status(&e);
+                return;
+            }
+        }
+        self.set_settings_status("已套用");
+        if store != *iv.store.borrow() {
+            *iv.store.borrow_mut() = store.clone();
+            if let Err(e) = store.save(&iv.store_path) {
+                eprintln!("目標：寫入 {} 失敗：{e}", iv.store_path.display());
+            }
+            eprintln!(
+                "設定：歸零前 {} 秒量測、{} 秒鎖定，已記在 target.toml",
+                store.measure_before_s, store.lock_before_s
+            );
+            self.rearm_if_pending();
+        }
+        if theme != *iv.theme.borrow() {
+            self.commit_theme(theme, "設定");
+        }
+        if self.session_purpose() != Some(Purpose::Countdown) {
+            self.refresh_settings_panel();
+        }
+    }
+
+    /// 「回復預設值」：把那一頁的鍵全部回到主題檔的值（對一般人來說就是預設值）。
+    fn reset_settings_tab(&self, tag: isize) {
+        let iv = self.state();
+        let base = iv.base_theme.borrow().clone();
+        let mut t = iv.theme.borrow().clone();
+        match tag {
+            TAB_TIMELINE => {
+                t.beat.period_ms = base.beat.period_ms;
+                t.beat.ticks = base.beat.ticks;
+                t.beat.visual_lead_s = base.beat.visual_lead_s;
+                t.beat.idle_ball = base.beat.idle_ball;
+                t.beat.tail_ms = base.beat.tail_ms;
+                t.beat.demo_lead_s = base.beat.demo_lead_s;
+                let mut store = iv.store.borrow().clone();
+                store.measure_before_s = DEFAULT_MEASURE_BEFORE.as_secs();
+                store.lock_before_s = DEFAULT_LOCK_BEFORE.as_secs();
+                if store != *iv.store.borrow() {
+                    *iv.store.borrow_mut() = store.clone();
+                    if let Err(e) = store.save(&iv.store_path) {
+                        eprintln!("目標：寫入 {} 失敗：{e}", iv.store_path.display());
+                    }
+                    self.rearm_if_pending();
+                }
+            }
+            TAB_BEAT => {
+                t.beat.style = base.beat.style;
+                t.beat.renderer = base.beat.renderer;
+                t.beat.strip_height = base.beat.strip_height;
+                t.beat.color = base.beat.color;
+                t.beat.final_color = base.beat.final_color;
+                t.beat.glow = base.beat.glow;
+                t.beat.glow_width = base.beat.glow_width;
+                t.beat.glow_opacity = base.beat.glow_opacity;
+            }
+            TAB_SOUND => {
+                t.beat.volume = base.beat.volume;
+                t.beat.tick_hz = base.beat.tick_hz;
+                t.beat.tick_ms = base.beat.tick_ms;
+                t.beat.final_ms = base.beat.final_ms;
+                t.beat.visual_lead_ms = base.beat.visual_lead_ms;
+            }
+            _ => return,
+        }
+        self.set_settings_status("這一頁已回復預設值");
+        if t != *iv.theme.borrow() {
+            self.commit_theme(t, "設定");
+        }
+        if self.session_purpose() != Some(Purpose::Countdown) {
+            self.refresh_settings_panel();
         }
     }
 
@@ -1439,6 +1712,31 @@ impl Controller {
         self.refresh_target_ui();
     }
 
+    /// 時間軸或量測／鎖定提前改了、而目標還在待命或量測：用新的設定重建狀態機（鎖定後不動）。
+    fn rearm_if_pending(&self) {
+        let iv = self.state();
+        let pending = matches!(
+            iv.target.borrow().as_ref().map(|m| m.stage()),
+            Some(Stage::Armed | Stage::Measuring)
+        );
+        if !pending {
+            return;
+        }
+        let Some(cfg) = iv.store.borrow().config() else {
+            return;
+        };
+        let margin = min_lock_margin(&iv.theme.borrow());
+        let m = TargetMachine::new(cfg, margin);
+        eprintln!(
+            "目標：重排時間軸，歸零前 {} 秒量測、{} 秒鎖定（至少 {:.1} 秒）",
+            m.config().measure_before.as_secs(),
+            m.config().lock_before.as_secs(),
+            margin.as_secs_f64() + 1.0
+        );
+        *iv.target.borrow_mut() = Some(m);
+        self.refresh_target_ui();
+    }
+
     pub fn clear_target(&self) {
         let iv = self.state();
         if self.session_purpose() == Some(Purpose::Countdown) {
@@ -1514,14 +1812,7 @@ impl Controller {
             Some(m) => m.config().zero_unix_ns(),
             None => return,
         };
-        let plan = {
-            let theme = iv.theme.borrow();
-            BeatPlan::new(
-                model.host_at(zero_remote),
-                theme.beat.period(),
-                theme.beat.ticks,
-            )
-        };
+        let plan = iv.theme.borrow().beat.plan(model.host_at(zero_remote));
         iv.sampler.pause();
         let est = model.estimate_at(HostTime::now());
         eprintln!(
@@ -1631,9 +1922,8 @@ impl Controller {
     /// 校正的每一輪：歸零在「現在＋畫面起跑所需時間＋半秒」。不需要模型，純主機時間。
     fn calibration_plan(&self) -> BeatPlan {
         let theme = self.state().theme.borrow();
-        let period = theme.beat.period();
-        let lead = period * theme.beat.ticks + Duration::from_millis(500);
-        BeatPlan::new(HostTime::now() + lead, period, theme.beat.ticks)
+        let lead = theme.beat.timeline().visual_lead + Duration::from_millis(500);
+        theme.beat.plan(HostTime::now() + lead)
     }
 
     pub fn start_calibration(&self) {
@@ -1786,7 +2076,7 @@ impl Controller {
         }
         let settle = ended || iv.gestures.magnify_ended.replace(false);
         self.service_zoom(settle);
-        self.service_state_save();
+        self.service_settings_save();
         if self.session_purpose() == Some(Purpose::Countdown) {
             return;
         }
@@ -1815,6 +2105,11 @@ impl Controller {
             && let Some(view) = p.panel.contentView()
         {
             snapshot_view(&view, &dir.join(format!("target-{frame}.png")));
+        }
+        if let Some(p) = iv.settings_panel.borrow().as_ref()
+            && let Some(view) = p.panel.contentView()
+        {
+            snapshot_view(&view, &dir.join(format!("settings-{frame}.png")));
         }
     }
 
@@ -1850,6 +2145,10 @@ impl Controller {
         if iv.calibrate_pending.get() && frame > 60 {
             iv.calibrate_pending.set(false);
             self.start_calibration();
+        }
+        if iv.settings_pending.get() && frame > 30 {
+            iv.settings_pending.set(false);
+            self.show_settings();
         }
         self.step_target(&model);
         let shown = iv.smoother.borrow_mut().tick(&model, at);
@@ -1919,15 +2218,21 @@ impl Controller {
             if at_v >= session.plan.end() {
                 ended = true;
             } else {
+                // 起跑前：要嘛畫靜止的球（`Phase::idle`），要嘛整個藏起來。
                 let phase = session
                     .plan
                     .phase_at(at_v)
-                    .unwrap_or_else(|| Phase::idle(&session.plan));
-                if let Some(strip) = face.strip.as_mut() {
-                    strip.render(&phase, at);
+                    .or_else(|| theme.beat.idle_ball.then(|| Phase::idle(&session.plan)));
+                match (face.strip.as_mut(), &phase) {
+                    (Some(strip), Some(p)) => strip.render(p, at),
+                    (Some(strip), None) => strip.set_hidden(true),
+                    (None, _) => {}
                 }
                 if let Some(glow) = session.glow.as_mut() {
-                    glow.set(glow_level(&phase), phase.is_final);
+                    match &phase {
+                        Some(p) => glow.set(glow_level(p), p.is_final),
+                        None => glow.set(0.0, false),
+                    }
                 }
                 for (k, t) in session.plan.tick_times() {
                     let d = at_v.signed_nanos_since(t) as f64 / 1e6;
@@ -1975,7 +2280,24 @@ fn snapshot_view(view: &objc2_app_kit::NSView, path: &std::path::Path) {
     }
 }
 
-/// 鎖定至少要在歸零前多久：畫面提早一拍起跑（`period × ticks`）加音訊暖機。
+/// 鎖定至少要在歸零前多久：畫面起跑所需的時間加音訊暖機。
 fn min_lock_margin(theme: &Theme) -> Duration {
-    theme.beat.period() * theme.beat.ticks + Duration::from_millis(500)
+    theme.beat.timeline().visual_lead + Duration::from_millis(500)
+}
+
+/// 哪些改動要重建面板：幾何、字型、顏色、節拍區的畫法、高度與顏色。
+/// 不透明度、時序、聲音、光暈、顯示提前量、時間來源都各有更輕的套法。
+fn needs_rebuild(old: &Theme, new: &Theme) -> bool {
+    let mut probe = new.clone();
+    probe.panel.opacity = old.panel.opacity;
+    probe.sync = old.sync.clone();
+    probe.display = old.display.clone();
+    probe.beat = Beat {
+        renderer: new.beat.renderer,
+        strip_height: new.beat.strip_height,
+        color: new.beat.color,
+        final_color: new.beat.final_color,
+        ..old.beat.clone()
+    };
+    probe != *old
 }

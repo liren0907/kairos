@@ -1,5 +1,7 @@
-//! 主題檔：字型、字級、顏色、間距、圓角、材質。存在
+//! 主題檔：字型、字級、顏色、間距、圓角、材質、節拍與時間軸、時間來源。存在
 //! `~/Library/Application Support/kairos/theme.toml`，`notify` 監看資料夾，存檔即時生效。
+//! 這是**手寫**的檔案，程式只讀不寫；設定視窗改的值另外記在 `settings.toml`
+//! 蓋在上面（見 `settings_store`）。
 //!
 //! 檔案不存在時寫入 [`DEFAULT_THEME_TOML`]（含註解）；解析失敗時沿用上一版並印到 stderr。
 //! 欄位名打錯會直接報錯（`deny_unknown_fields`），比默默忽略好找。
@@ -10,6 +12,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use kairos_core::time::HostTime;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use objc2::rc::Retained;
 use objc2_app_kit::{
@@ -18,13 +21,16 @@ use objc2_app_kit::{
     NSVisualEffectMaterial,
 };
 use objc2_foundation::NSString;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
+use kairos_core::beat::BeatPlan;
 use kairos_core::beat::audio::TickSound;
 use kairos_core::sync::{SamplerConfig, SyncSettings};
 
 /// 預設主題，也是第一次啟動時寫到磁碟的內容。
 pub const DEFAULT_THEME_TOML: &str = r##"# kairos 主題檔。存檔即時生效；寫錯會在終端機印出錯誤並沿用上一版。
+# 選單列的「設定…」視窗改的值記在旁邊的 settings.toml、蓋在這個檔案上面；這裡改了同一個鍵，
+# 就以這裡為準（最後一次動作為準）。
 
 [panel]
 width = 320            # 點；高度依內容自動算
@@ -61,10 +67,14 @@ idle_fps = 60          # 平常的刷新率；節拍期間會拉到面板所在�
                        # "DELL P2421D" = 8
 
 [beat]
-style = "auto"         # auto | ball | ring | pulse；auto＝ball，系統開「減少動態效果」時改 pulse；選單「節拍樣式」可暫時蓋過，改這裡就回到依主題檔
+style = "auto"         # auto | ball | ring | pulse；auto＝ball，系統開「減少動態效果」時改 pulse
 renderer = "auto"      # auto | metal | layer；auto＝有 Metal 就用 Metal 畫節拍區並量每一格實際上屏的時刻，layer＝CALayer
 period_ms = 1000       # 拍距
-ticks = 4              # 拍數，含歸零那一拍；聲音從第一拍起，畫面提早一拍起跑
+ticks = 4              # 有聲的拍數，含歸零那一拍
+visual_lead_s = 0      # 畫面在歸零前幾秒起跑；會往前取整到整拍；0＝自動（第一聲前一拍起跑）；多出來的拍落地無聲
+idle_ball = true       # 鎖定到起跑之間先顯示靜止的球（false＝節拍區空著，起跑才出現）
+tail_ms = 1500         # 歸零後畫面停留多久，讓閃光與光暈衰減完
+demo_lead_s = 5        # 「試聽節拍」在幾秒後歸零（不夠畫面起跑就自動拉長）
 strip_height = 64      # 節拍區高度（點），只在節拍期間出現在數字上方
 color = "#5AA9FF"
 final_color = "#FFB454" # 歸零拍的顏色（尺寸也放大）
@@ -84,8 +94,8 @@ spacing_ms = 1000      # 同一台兩筆的間隔（≥ 200）
 cycle_s = 180          # 兩輪之間的間隔（≥ 60）
 "##;
 
-#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
-#[serde(try_from = "String")]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct Color {
     pub r: f64,
     pub g: f64,
@@ -100,6 +110,24 @@ impl Color {
 
     pub fn nscolor(&self) -> Retained<NSColor> {
         NSColor::colorWithSRGBRed_green_blue_alpha(self.r, self.g, self.b, self.a)
+    }
+}
+
+impl From<Color> for String {
+    /// 存回 `#RRGGBB`（不透明）或 `#RRGGBBAA`，每個分量量化成 8 位元。
+    fn from(c: Color) -> String {
+        let byte = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        if c.a >= 1.0 {
+            format!("#{:02X}{:02X}{:02X}", byte(c.r), byte(c.g), byte(c.b))
+        } else {
+            format!(
+                "#{:02X}{:02X}{:02X}{:02X}",
+                byte(c.r),
+                byte(c.g),
+                byte(c.b),
+                byte(c.a)
+            )
+        }
     }
 }
 
@@ -127,7 +155,7 @@ impl TryFrom<String> for Color {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Material {
     Hud,
@@ -151,7 +179,7 @@ impl Material {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Appearance {
     Dark,
@@ -174,7 +202,7 @@ impl Appearance {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Weight {
     Regular,
@@ -183,7 +211,7 @@ pub enum Weight {
     Bold,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Panel {
     pub width: f64,
@@ -205,7 +233,7 @@ impl Default for Panel {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Font {
     pub family: String,
@@ -249,7 +277,7 @@ impl Font {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Colors {
     pub time: Color,
@@ -271,7 +299,7 @@ impl Default for Colors {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Layout {
     pub padding: f64,
@@ -291,7 +319,7 @@ impl Default for Layout {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Display {
     pub lead_ms: f64,
@@ -320,7 +348,7 @@ impl Display {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BeatStyle {
     Auto,
@@ -331,7 +359,7 @@ pub enum BeatStyle {
 
 /// 節拍區用什麼畫：`auto` 有 Metal 就用（順便量實際上屏時刻），`metal` 一樣但拿不到會大聲抱怨，
 /// `layer` 維持 CALayer。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BeatRenderer {
     Auto,
@@ -339,7 +367,7 @@ pub enum BeatRenderer {
     Layer,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Beat {
     pub style: BeatStyle,
@@ -357,6 +385,14 @@ pub struct Beat {
     pub tick_ms: f64,
     pub final_ms: f64,
     pub visual_lead_ms: f64,
+    /// 畫面在歸零前幾秒起跑（往前取整到整拍）；0＝自動，第一聲前一拍。
+    pub visual_lead_s: f64,
+    /// 鎖定到起跑之間顯示靜止的球；`false` 節拍區空著。
+    pub idle_ball: bool,
+    /// 歸零後的收尾期。
+    pub tail_ms: f64,
+    /// 「試聽節拍」在幾秒後歸零。
+    pub demo_lead_s: f64,
 }
 
 impl Default for Beat {
@@ -377,13 +413,97 @@ impl Default for Beat {
             tick_ms: 30.0,
             final_ms: 200.0,
             visual_lead_ms: 0.0,
+            visual_lead_s: 0.0,
+            idle_ball: true,
+            tail_ms: 1500.0,
+            demo_lead_s: 5.0,
         }
+    }
+}
+
+/// 一次節拍程序的時間軸，給紀錄與設定視窗看。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Timeline {
+    pub period: Duration,
+    pub ticks: u32,
+    pub lead_beats: u32,
+    /// 畫面起跑比歸零早多久。
+    pub visual_lead: Duration,
+    /// 使用者填的秒數；0 是自動。
+    pub requested_s: f64,
+    pub tail: Duration,
+}
+
+impl Timeline {
+    pub fn total_beats(&self) -> u32 {
+        self.ticks - 1 + self.lead_beats
+    }
+
+    /// 「歸零前 10.0 秒起跑（共 10 拍，前 6 次落地無聲；你填 9.3 秒，取整到 10）」。
+    pub fn describe(&self) -> String {
+        let silent = self.lead_beats - 1;
+        let mut out = format!(
+            "歸零前 {:.1} 秒起跑（共 {} 拍，{}",
+            self.visual_lead.as_secs_f64(),
+            self.total_beats(),
+            if silent == 0 {
+                "每次落地都有聲".to_string()
+            } else {
+                format!("前 {silent} 次落地無聲")
+            }
+        );
+        let rounded = (self.visual_lead.as_secs_f64() - self.requested_s).abs() > 1e-9;
+        if self.requested_s > 0.0 && rounded {
+            out.push_str(&format!(
+                "；你填 {:.1} 秒，取整到 {:.1}",
+                self.requested_s,
+                self.visual_lead.as_secs_f64()
+            ));
+        } else if self.requested_s <= 0.0 {
+            out.push_str("；自動");
+        }
+        out.push_str(&format!("），歸零後停留 {:.1} 秒", self.tail.as_secs_f64()));
+        out
     }
 }
 
 impl Beat {
     pub fn period(&self) -> Duration {
         Duration::from_secs_f64(self.period_ms.max(1.0) / 1e3)
+    }
+
+    /// 第一聲前要留幾拍：`visual_lead_s` 往前取整到整拍，至少 1。
+    pub fn lead_beats(&self) -> u32 {
+        let lead = Duration::from_secs_f64(self.visual_lead_s.clamp(0.0, 3600.0));
+        BeatPlan::lead_beats_for(lead, self.period(), self.ticks)
+    }
+
+    pub fn tail(&self) -> Duration {
+        Duration::from_secs_f64(self.tail_ms.clamp(0.0, 60_000.0) / 1e3)
+    }
+
+    /// 「試聽節拍」在幾秒後歸零；至少 1 秒。
+    pub fn demo_lead(&self) -> Duration {
+        Duration::from_secs_f64(self.demo_lead_s.clamp(1.0, 3600.0))
+    }
+
+    /// 以這份設定排一次節拍程序，歸零在主機時刻 `zero`。
+    pub fn plan(&self, zero: HostTime) -> BeatPlan {
+        BeatPlan::new(zero, self.period(), self.ticks)
+            .with_lead(self.lead_beats())
+            .with_tail(self.tail())
+    }
+
+    pub fn timeline(&self) -> Timeline {
+        let plan = self.plan(HostTime::from_ticks(0));
+        Timeline {
+            period: plan.period,
+            ticks: plan.ticks,
+            lead_beats: plan.lead_beats,
+            visual_lead: plan.visual_lead(),
+            requested_s: self.visual_lead_s,
+            tail: plan.tail,
+        }
     }
 
     pub fn sound(&self) -> TickSound {
@@ -405,7 +525,7 @@ impl Beat {
 }
 
 /// `[sync]`：伺服器清單與取樣節奏。驗證在 core 的 `SyncSettings::new`。
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Sync {
     pub servers: Vec<String>,
@@ -437,7 +557,7 @@ impl Sync {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Default, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Theme {
     pub panel: Panel,
@@ -468,6 +588,15 @@ impl Theme {
 
     pub fn parse(text: &str) -> Result<Theme, toml::de::Error> {
         toml::from_str(text)
+    }
+
+    /// 整份主題攤成 TOML 表（每個段落都在，顏色是 `#RRGGBB` 字串），給設定的覆寫層比對與合併。
+    pub fn to_table(&self) -> toml::Table {
+        toml::Table::try_from(self).expect("主題的每個欄位都能序列化")
+    }
+
+    pub fn from_table(table: toml::Table) -> Result<Theme, toml::de::Error> {
+        table.try_into()
     }
 
     /// `~/Library/Application Support/kairos/theme.toml`。
@@ -568,6 +697,64 @@ mod tests {
             BeatRenderer::Layer
         );
         assert!(Theme::parse("[beat]\nrenderer = \"vulkan\"\n").is_err());
+    }
+
+    #[test]
+    fn timeline_keys_build_the_plan_and_describe_it() {
+        let mut b = Beat::default();
+        let t = b.timeline();
+        assert_eq!((t.lead_beats, t.total_beats()), (1, 4));
+        assert_eq!(t.visual_lead, Duration::from_secs(4));
+        assert!(t.describe().contains("每次落地都有聲"), "{}", t.describe());
+        assert!(t.describe().contains("自動"));
+
+        b.visual_lead_s = 9.3;
+        b.tail_ms = 800.0;
+        let plan = b.plan(HostTime::from_nanos(100_000_000_000));
+        assert_eq!(plan.lead_beats, 7);
+        assert_eq!(plan.tail, Duration::from_millis(800));
+        assert_eq!(plan.visual_lead(), Duration::from_secs(10));
+        let d = b.timeline().describe();
+        assert!(
+            d.contains("共 10 拍") && d.contains("前 6 次落地無聲"),
+            "{d}"
+        );
+        assert!(d.contains("你填 9.3 秒，取整到 10.0"), "{d}");
+        assert!(d.contains("停留 0.8 秒"), "{d}");
+
+        b.visual_lead_s = -3.0;
+        assert_eq!(b.lead_beats(), 1);
+        b.demo_lead_s = 0.0;
+        assert_eq!(b.demo_lead(), Duration::from_secs(1));
+        let parsed = Theme::parse("[beat]\nvisual_lead_s = 12\nidle_ball = false\n").unwrap();
+        assert!(!parsed.beat.idle_ball);
+        assert_eq!(parsed.beat.lead_beats(), 9);
+    }
+
+    #[test]
+    fn theme_serializes_to_a_full_table_and_back() {
+        let t = Theme::default();
+        let table = t.to_table();
+        for section in [
+            "panel", "font", "colors", "layout", "display", "beat", "sync",
+        ] {
+            assert!(table.contains_key(section), "{section}");
+        }
+        assert_eq!(
+            table["colors"]["bar"].as_str(),
+            Some("#5AA9FF"),
+            "顏色存成十六進位字串"
+        );
+        assert_eq!(table["beat"]["style"].as_str(), Some("auto"));
+        assert_eq!(Theme::from_table(table).unwrap(), t);
+
+        let c = Color::rgba(0.2, 0.4, 0.6, 0.5);
+        let text: String = c.into();
+        assert_eq!(text, "#33669980");
+        let back = Color::try_from(text).unwrap();
+        assert!((back.r - 0x33 as f64 / 255.0).abs() < 1e-9);
+        let opaque: String = Color::rgba(1.0, 0.0, 0.0, 1.0).into();
+        assert_eq!(opaque, "#FF0000");
     }
 
     #[test]

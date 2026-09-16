@@ -411,6 +411,11 @@ impl MetalStrip {
         self.layer.removeFromSuperlayer();
     }
 
+    /// 起跑前不想看到靜止的球就藏起圖層；藏著的時候呼叫端不會來 `render`。
+    pub fn set_hidden(&self, hidden: bool) {
+        self.layer.setHidden(hidden);
+    }
+
     /// 畫這一格並排上屏。`target` 是顯示連結說這一格會上屏的時刻，跟實際上屏一起記下來。
     /// 呼叫端要包在關掉隱式動畫的 `CATransaction` 裡。
     pub fn render(&mut self, phase: &Phase, target: HostTime) {

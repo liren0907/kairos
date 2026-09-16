@@ -5,6 +5,7 @@
 //! 階段二：浮動面板——毛玻璃、顯示連結每格更新、字形圖集數字、主題熱重載、全域熱鍵。
 //! 階段三：節拍——拍點表、面板節拍區、螢幕邊緣光暈、cpal 滴答聲、每螢幕的顯示提前量。
 //! 階段四：目標時刻——原生目標面板、狀態機自動量測與鎖定、凍結取樣、反應時間校正。
+//! 階段五：設定視窗——選單列「設定…」，頁籤分組、即時生效，覆寫記在 settings.toml、主題檔不動。
 //!
 //! 這一層只做接線，邏輯都在 `kairos-core` 與各模組。
 
@@ -17,7 +18,8 @@ mod glow;
 mod hotkey;
 mod metal_strip;
 mod panel;
-mod state_store;
+mod settings_panel;
+mod settings_store;
 mod target_panel;
 mod target_store;
 mod text;
@@ -248,6 +250,9 @@ fn build_status_item(
     menu.addItem(&items.panel);
     menu.addItem(&items.click_through);
     menu.addItem(&build_appearance_item(mtm, target));
+    let settings = action_item(mtm, "設定…", sel!(showSettings:), target);
+    settings.setKeyEquivalent(&NSString::from_str(","));
+    menu.addItem(&settings);
     menu.addItem(&action_item(
         mtm,
         "重新載入主題",
@@ -376,13 +381,36 @@ fn main() {
 
     let theme_path = theme::Theme::default_path();
     eprintln!("主題檔：{}", theme_path.display());
-    let theme = match theme::Theme::load_or_create(&theme_path) {
+    let base = match theme::Theme::load_or_create(&theme_path) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("主題：讀取 {} 失敗（{e}），用預設值", theme_path.display());
             theme::Theme::default()
         }
     };
+    // 設定（大小倍率、設定視窗改過的鍵）蓋在主題檔上面；覆寫套不上就整個作廢。
+    let settings_path = settings_store::Settings::default_path();
+    let mut settings = settings_store::Settings::load(&settings_path);
+    let theme = match settings.effective(&base) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "設定：{} 的 [theme] 覆寫套不上（{e}），全部作廢",
+                settings_path.display()
+            );
+            settings.theme.clear();
+            base.clone()
+        }
+    };
+    if settings != settings_store::Settings::default() {
+        eprintln!(
+            "設定：{}（大小 {:.0}%，{} 個覆寫：{}）",
+            settings_path.display(),
+            settings.zoom * 100.0,
+            settings_store::leaf_count(&settings.theme),
+            settings_store::describe(&settings.theme)
+        );
+    }
 
     let mut config = SamplerConfig::default();
     match theme.sync.settings() {
@@ -410,14 +438,15 @@ fn main() {
     }
     let store_path = target_store::TargetFile::default_path();
     eprintln!("目標檔：{}", store_path.display());
-    let state_path = state_store::ViewState::default_path();
     let controller = Controller::new(
         mtm,
         sampler.clone(),
+        base,
         theme,
+        settings,
         theme_path,
         store_path,
-        state_path,
+        settings_path,
     );
 
     let (_status_item, rows, items) = build_status_item(mtm, &controller);
@@ -439,7 +468,7 @@ fn main() {
 
     controller.start();
     eprintln!(
-        "面板已顯示；拖邊緣或捏合改大小、滾輪改不透明度；選單列的碼錶圖示可隱藏面板、切換滑鼠穿透、重新載入主題、設目標時刻、校正反應時間、試聽節拍、換節拍樣式，Quit 或 Cmd-Q 結束"
+        "面板已顯示；拖邊緣或捏合改大小、滾輪改不透明度；選單列的碼錶圖示可打開「設定…」、隱藏面板、切換滑鼠穿透、重新載入主題、設目標時刻、校正反應時間、試聽節拍、換節拍樣式，Quit 或 Cmd-Q 結束"
     );
 
     app.run();

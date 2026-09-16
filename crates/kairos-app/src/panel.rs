@@ -20,7 +20,7 @@ use kairos_core::display::DIGIT_CELLS;
 use crate::atlas::GlyphAtlas;
 use crate::beat_view::{BeatStrip, StripKind};
 use crate::metal_strip::MetalStrip;
-use crate::state_store::{MAX_ZOOM, MIN_ZOOM};
+use crate::settings_store::{MAX_ZOOM, MIN_ZOOM};
 use crate::theme::{BeatRenderer, Theme};
 use kairos_core::beat::Phase;
 use kairos_core::time::HostTime;
@@ -34,9 +34,18 @@ pub enum Strip {
 impl Strip {
     /// 呼叫端要包在關掉隱式動畫的 `CATransaction` 裡。`target` 是這一格預定上屏的時刻。
     pub fn render(&mut self, phase: &Phase, target: HostTime) {
+        self.set_hidden(false);
         match self {
             Strip::Layer(s) => s.render(phase),
             Strip::Metal(s) => s.render(phase, target),
+        }
+    }
+
+    /// 起跑前空著（`idle_ball = false`）：藏起來、不畫。
+    pub fn set_hidden(&mut self, hidden: bool) {
+        match self {
+            Strip::Layer(s) => s.set_hidden(hidden),
+            Strip::Metal(s) => s.set_hidden(hidden),
         }
     }
 
