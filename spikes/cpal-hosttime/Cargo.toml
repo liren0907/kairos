@@ -12,4 +12,6 @@ name = "cpal-hosttime"
 path = "src/main.rs"
 
 [dependencies]
+cpal = "0.16"
 libc.workspace = true
+mach2.workspace = true
