@@ -29,8 +29,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{MainThreadMarker, MainThreadOnly, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSControlStateValueOn, NSMenu, NSMenuItem,
-    NSScreen, NSStatusBar, NSStatusItem, NSVariableStatusItemLength, NSWorkspace,
+    NSApplication, NSApplicationActivationPolicy, NSControlStateValueOn, NSImage, NSMenu,
+    NSMenuItem, NSScreen, NSStatusBar, NSStatusItem, NSVariableStatusItemLength, NSWorkspace,
     NSWorkspaceDidWakeNotification,
 };
 use objc2_foundation::{
@@ -108,7 +108,21 @@ fn build_status_item(
 ) -> (Retained<NSStatusItem>, StatusRows, MenuItems) {
     let item = NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
     if let Some(button) = item.button(mtm) {
-        button.setTitle(&NSString::from_str("⏱"));
+        // SF Symbol 的 template 圖：跟系統自己的狀態列項目同一套渲染，大小、粗細、
+        // 深淺色與按下反白都由系統處理。符號不存在時（macOS 11 起就有，不該發生）退回文字。
+        match NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            &NSString::from_str("stopwatch"),
+            Some(&NSString::from_str("Kairos")),
+        ) {
+            Some(image) => {
+                image.setTemplate(true);
+                button.setImage(Some(&image));
+            }
+            None => {
+                eprintln!("找不到 SF Symbol「stopwatch」，選單列退回文字圖示");
+                button.setTitle(&NSString::from_str("⏱"));
+            }
+        }
     }
 
     let menu = NSMenu::new(mtm);
@@ -296,7 +310,7 @@ fn main() {
 
     controller.start();
     eprintln!(
-        "面板已顯示；選單列 ⏱ 可隱藏面板、切換滑鼠穿透、重新載入主題、設目標時刻、校正反應時間、試聽節拍，Quit 或 Cmd-Q 結束"
+        "面板已顯示；選單列的碼錶圖示可隱藏面板、切換滑鼠穿透、重新載入主題、設目標時刻、校正反應時間、試聽節拍，Quit 或 Cmd-Q 結束"
     );
 
     app.run();
