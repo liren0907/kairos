@@ -8,17 +8,20 @@
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly, sel};
+use std::cell::RefCell;
+
 use objc2_app_kit::{
     NSApplication, NSBackingStoreType, NSButton, NSColorSpace, NSColorWell, NSControlStateValue,
-    NSControlStateValueOff, NSControlStateValueOn, NSFloatingWindowLevel, NSFont, NSLineBreakMode,
-    NSPanel, NSPopUpButton, NSSlider, NSStepper, NSTabView, NSTabViewItem, NSTextAlignment,
-    NSTextField, NSView, NSWindowStyleMask,
+    NSControlStateValueOff, NSControlStateValueOn, NSFloatingWindowLevel, NSFont, NSFontManager,
+    NSLineBreakMode, NSPanel, NSPopUpButton, NSScreen, NSSlider, NSStepper, NSTabView,
+    NSTabViewItem, NSTextAlignment, NSTextField, NSView, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::NSString;
 
+use crate::settings_store::{MAX_OPACITY, MIN_OPACITY};
 use crate::target_store::TargetFile;
-use crate::theme::{BeatRenderer, BeatStyle, Color, Theme};
+use crate::theme::{Appearance, BeatRenderer, BeatStyle, Color, Material, Theme, Weight};
 
 const WIDTH: f64 = 560.0;
 const HEIGHT: f64 = 500.0;
@@ -32,6 +35,10 @@ const CONTROL_X: f64 = MARGIN + LABEL_W + 8.0;
 pub const TAB_TIMELINE: isize = 0;
 pub const TAB_BEAT: isize = 1;
 pub const TAB_SOUND: isize = 2;
+pub const TAB_PANEL: isize = 3;
+pub const TAB_FONT: isize = 4;
+pub const TAB_DISPLAY: isize = 5;
+pub const TAB_SYNC: isize = 6;
 
 const STYLES: [BeatStyle; 4] = [
     BeatStyle::Auto,
@@ -42,6 +49,31 @@ const STYLES: [BeatStyle; 4] = [
 const STYLE_TITLES: [&str; 4] = ["自動（系統減少動態效果時改脈衝）", "球", "環", "脈衝"];
 const RENDERERS: [BeatRenderer; 3] = [BeatRenderer::Auto, BeatRenderer::Metal, BeatRenderer::Layer];
 const RENDERER_TITLES: [&str; 3] = ["自動（有 Metal 就用）", "Metal", "CALayer"];
+const MATERIALS: [Material; 6] = [
+    Material::Hud,
+    Material::Popover,
+    Material::Sidebar,
+    Material::Menu,
+    Material::UnderWindow,
+    Material::WindowBackground,
+];
+const MATERIAL_TITLES: [&str; 6] = [
+    "毛玻璃（HUD）",
+    "彈出框",
+    "側欄",
+    "選單",
+    "視窗底",
+    "視窗背景",
+];
+const APPEARANCES: [Appearance; 3] = [Appearance::Dark, Appearance::Light, Appearance::System];
+const APPEARANCE_TITLES: [&str; 3] = ["深色", "淺色", "跟著系統"];
+const WEIGHTS: [Weight; 4] = [
+    Weight::Regular,
+    Weight::Medium,
+    Weight::Semibold,
+    Weight::Bold,
+];
+const WEIGHT_TITLES: [&str; 4] = ["一般", "中等", "半粗", "粗"];
 
 fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
     CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
@@ -148,6 +180,75 @@ impl Popup {
     }
 }
 
+/// 可留空的數字列：空白代表「依預設」。步進器從預設值起跳。
+pub struct OptionalNumber {
+    inner: Number,
+}
+
+impl OptionalNumber {
+    pub fn set(&self, v: Option<f64>, fallback: f64) {
+        match v {
+            Some(v) => self.inner.set(v),
+            None => {
+                self.inner.field.setStringValue(&ns(""));
+                self.inner.stepper.setDoubleValue(fallback);
+            }
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Result<Option<f64>, String> {
+        if self.inner.field.stringValue().to_string().trim().is_empty() {
+            return Ok(None);
+        }
+        self.inner.get(name).map(Some)
+    }
+}
+
+/// 字型家族：第一項「系統字型」，其餘是 `NSFontManager` 的清單；主題檔填了清單裡沒有的名字，
+/// 多列一項標「找不到」，讓視窗如實反映檔案。
+pub struct FontPopup {
+    button: Retained<NSPopUpButton>,
+    families: Vec<String>,
+    extra: RefCell<Option<String>>,
+}
+
+impl FontPopup {
+    /// 空字串＝系統字型。
+    pub fn set(&self, family: &str) {
+        if family.is_empty() {
+            self.button.selectItemAtIndex(0);
+            return;
+        }
+        if let Some(i) = self.families.iter().position(|f| f == family) {
+            self.button.selectItemAtIndex(i as isize + 1);
+            return;
+        }
+        let mut extra = self.extra.borrow_mut();
+        if extra.as_deref() != Some(family) {
+            if extra.is_some() {
+                self.button
+                    .removeItemAtIndex(self.button.numberOfItems() - 1);
+            }
+            self.button
+                .addItemWithTitle(&ns(&format!("{family}（找不到）")));
+            *extra = Some(family.to_string());
+        }
+        self.button
+            .selectItemAtIndex(self.button.numberOfItems() - 1);
+    }
+
+    pub fn get(&self) -> String {
+        let i = self.button.indexOfSelectedItem();
+        if i <= 0 {
+            String::new()
+        } else if (i as usize) <= self.families.len() {
+            self.families[i as usize - 1].clone()
+        } else {
+            self.extra.borrow().clone().unwrap_or_default()
+        }
+    }
+}
+
 fn check_state(on: bool) -> NSControlStateValue {
     if on {
         NSControlStateValueOn
@@ -236,11 +337,46 @@ impl Page {
         step: f64,
         decimals: usize,
     ) -> Number {
+        self.number_with(target, title, hint, min, max, step, decimals, None)
+    }
+
+    /// 留空代表依預設的數字列。
+    #[allow(clippy::too_many_arguments)]
+    fn optional_number(
+        &mut self,
+        target: &AnyObject,
+        title: &str,
+        hint: &str,
+        min: f64,
+        max: f64,
+        step: f64,
+        decimals: usize,
+    ) -> OptionalNumber {
+        OptionalNumber {
+            inner: self.number_with(target, title, hint, min, max, step, decimals, Some("預設")),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn number_with(
+        &mut self,
+        target: &AnyObject,
+        title: &str,
+        hint: &str,
+        min: f64,
+        max: f64,
+        step: f64,
+        decimals: usize,
+        placeholder: Option<&str>,
+    ) -> Number {
         let i = self.open_row(title);
         let y = self.y(i);
         let field = NSTextField::textFieldWithString(&ns(""), self.mtm);
         field.setFrame(rect(CONTROL_X, y, 84.0, 24.0));
         field.setAlignment(NSTextAlignment::Right);
+        if let Some(text) = placeholder {
+            field.setPlaceholderString(Some(&ns(text)));
+        }
         if let Some(cell) = field.cell() {
             // 按 Enter 或點到別處都算改完。
             cell.setSendsActionOnEndEditing(true);
@@ -293,6 +429,57 @@ impl Page {
             value,
             percent,
         }
+    }
+
+    /// 整列寬的文字欄（伺服器清單用）。
+    fn text(&mut self, target: &AnyObject, title: &str) -> Retained<NSTextField> {
+        let i = self.open_row(title);
+        let field = NSTextField::textFieldWithString(&ns(""), self.mtm);
+        field.setFrame(rect(CONTROL_X, self.y(i), self.control_w(), 24.0));
+        if let Some(cell) = field.cell() {
+            cell.setSendsActionOnEndEditing(true);
+        }
+        wire(&field, target, sel!(settingChanged:));
+        self.view.addSubview(&field);
+        field
+    }
+
+    fn font_popup(&mut self, target: &AnyObject, title: &str) -> FontPopup {
+        let families: Vec<String> = NSFontManager::sharedFontManager(self.mtm)
+            .availableFontFamilies()
+            .iter()
+            .map(|f| f.to_string())
+            .collect();
+        let mut titles: Vec<&str> = vec!["系統字型（數字等寬）"];
+        titles.extend(families.iter().map(String::as_str));
+        let popup = self.popup(target, title, &titles);
+        FontPopup {
+            button: popup.button,
+            families,
+            extra: RefCell::new(None),
+        }
+    }
+
+    /// 一列裡的一顆動作按鈕，左欄留空。
+    fn action_button(
+        &mut self,
+        target: &AnyObject,
+        title: &str,
+        action: Sel,
+    ) -> Retained<NSButton> {
+        let i = self.open_row("");
+        // SAFETY: selector 是 Controller 的方法；target 型別正確，活到程式結束。
+        let b = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &ns(title),
+                Some(target),
+                Some(action),
+                self.mtm,
+            )
+        };
+        b.setFrame(rect(CONTROL_X, self.y(i) - 4.0, 160.0, 30.0));
+        self.view.addSubview(&b);
+        b
     }
 
     fn popup(&mut self, target: &AnyObject, title: &str, titles: &[&str]) -> Popup {
@@ -415,6 +602,39 @@ pub struct SettingsPanel {
     tick_ms: Number,
     final_ms: Number,
     visual_lead_ms: Number,
+    // 面板
+    width: Number,
+    corner_radius: Number,
+    material: Popup,
+    appearance: Popup,
+    opacity: Slider,
+    padding: Number,
+    line_gap: Number,
+    bar_height: Number,
+    bar_full_scale_ms: Number,
+    // 字型與顏色
+    family: FontPopup,
+    weight: Popup,
+    time_size: Number,
+    detail_size: Number,
+    caption_size: Number,
+    color_time: Retained<NSColorWell>,
+    color_detail: Retained<NSColorWell>,
+    color_caption: Retained<NSColorWell>,
+    color_bar: Retained<NSColorWell>,
+    color_bar_track: Retained<NSColorWell>,
+    // 顯示
+    lead_ms: Number,
+    idle_fps: Number,
+    /// 打開視窗時接著的每台螢幕一列；沒接著的螢幕在檔案裡的覆寫不動。
+    screens: Vec<(String, OptionalNumber)>,
+    present_info: Retained<NSTextField>,
+    // 時間來源
+    servers: Retained<NSTextField>,
+    burst: Number,
+    spacing_ms: Number,
+    cycle_s: Number,
+    tabs: Retained<NSTabView>,
     centered: std::cell::Cell<bool>,
 }
 
@@ -556,6 +776,111 @@ impl SettingsPanel {
         p.reset_button(target, TAB_SOUND);
         p.finish(&tabs, "聲音");
 
+        // ---- 面板 ----
+        let mut p = Page::new(mtm, page_size);
+        let width = p.number(
+            target,
+            "寬（點）",
+            "實際寬＝這個 × 面板上拖出來的倍率",
+            200.0,
+            1200.0,
+            10.0,
+            0,
+        );
+        let corner_radius = p.number(target, "圓角（點）", "", 0.0, 60.0, 1.0, 0);
+        let material = p.popup(target, "材質", &MATERIAL_TITLES);
+        let appearance = p.popup(target, "外觀", &APPEARANCE_TITLES);
+        let opacity = p.slider(target, "不透明度", MIN_OPACITY, MAX_OPACITY, true);
+        let padding = p.number(target, "內距（點）", "四邊留白", 4.0, 64.0, 1.0, 0);
+        let line_gap = p.number(target, "行距（點）", "", 0.0, 30.0, 1.0, 0);
+        let bar_height = p.number(target, "長條粗細（點）", "", 1.0, 20.0, 1.0, 0);
+        let bar_full_scale_ms = p.number(
+            target,
+            "長條滿格（± ms）",
+            "不確定度長條滿格對應的 ± 毫秒",
+            5.0,
+            1000.0,
+            5.0,
+            0,
+        );
+        p.reset_button(target, TAB_PANEL);
+        p.finish(&tabs, "面板");
+
+        // ---- 字型與顏色 ----
+        let mut p = Page::new(mtm, page_size);
+        let family = p.font_popup(target, "字型");
+        let weight = p.popup(target, "粗細", &WEIGHT_TITLES);
+        let time_size = p.number(target, "時間字級", "太大會超出面板寬", 16.0, 120.0, 1.0, 0);
+        let detail_size = p.number(target, "細節字級", "± 與狀態那一列", 8.0, 40.0, 1.0, 0);
+        let caption_size = p.number(target, "說明字級", "最底下那兩列", 8.0, 40.0, 1.0, 0);
+        let color_time = p.color(target, "時間顏色", "");
+        let color_detail = p.color(target, "細節顏色", "");
+        let color_caption = p.color(target, "說明顏色", "");
+        let color_bar = p.color(target, "長條顏色", "");
+        let color_bar_track = p.color(target, "長條底色", "");
+        p.reset_button(target, TAB_FONT);
+        p.finish(&tabs, "字型與顏色");
+
+        // ---- 顯示 ----
+        let mut p = Page::new(mtm, page_size);
+        let lead_ms = p.number(
+            target,
+            "預設提前量（ms）",
+            "畫面實際上屏比預測晚多少",
+            -50.0,
+            200.0,
+            1.0,
+            0,
+        );
+        let idle_fps = p.number(
+            target,
+            "平常刷新率（Hz）",
+            "節拍期間會拉到螢幕最高",
+            10.0,
+            240.0,
+            10.0,
+            0,
+        );
+        let mut screens = Vec::new();
+        for screen in NSScreen::screens(mtm).iter() {
+            let name = screen.localizedName().to_string();
+            let field = p.optional_number(
+                target,
+                &name,
+                "這台的提前量；留空＝依預設",
+                -50.0,
+                200.0,
+                1.0,
+                0,
+            );
+            screens.push((name, field));
+        }
+        let present_info = p.info(2);
+        p.action_button(target, "填進這個螢幕", sel!(adoptPresentOffset:));
+        p.reset_button(target, TAB_DISPLAY);
+        p.finish(&tabs, "顯示");
+
+        // ---- 時間來源 ----
+        let mut p = Page::new(mtm, page_size);
+        let servers = p.text(target, "伺服器");
+        let sync_info = p.info(1);
+        sync_info.setStringValue(&ns(
+            "以空白或逗號分隔，1 到 8 台；存了就換上、立刻跑一輪，鎖定期間等解凍",
+        ));
+        let burst = p.number(target, "每台幾筆", "每一輪", 1.0, 8.0, 1.0, 0);
+        let spacing_ms = p.number(
+            target,
+            "同一台間隔（ms）",
+            "兩筆之間",
+            200.0,
+            10_000.0,
+            100.0,
+            0,
+        );
+        let cycle_s = p.number(target, "兩輪之間（秒）", "", 60.0, 3600.0, 30.0, 0);
+        p.reset_button(target, TAB_SYNC);
+        p.finish(&tabs, "時間來源");
+
         content.addSubview(&tabs);
 
         SettingsPanel {
@@ -583,7 +908,42 @@ impl SettingsPanel {
             tick_ms,
             final_ms,
             visual_lead_ms,
+            width,
+            corner_radius,
+            material,
+            appearance,
+            opacity,
+            padding,
+            line_gap,
+            bar_height,
+            bar_full_scale_ms,
+            family,
+            weight,
+            time_size,
+            detail_size,
+            caption_size,
+            color_time,
+            color_detail,
+            color_caption,
+            color_bar,
+            color_bar_track,
+            lead_ms,
+            idle_fps,
+            screens,
+            present_info,
+            servers,
+            burst,
+            spacing_ms,
+            cycle_s,
+            tabs,
             centered: std::cell::Cell::new(false),
+        }
+    }
+
+    /// 切到第 `i` 頁（開發用：快照指定的頁）。
+    pub fn select_tab(&self, i: isize) {
+        if (0..self.tabs.numberOfTabViewItems()).contains(&i) {
+            self.tabs.selectTabViewItemAtIndex(i);
         }
     }
 
@@ -597,8 +957,8 @@ impl SettingsPanel {
         NSApplication::sharedApplication(mtm).activate();
     }
 
-    fn numbers(&self) -> [&Number; 13] {
-        [
+    fn numbers(&self) -> Vec<&Number> {
+        let mut v = vec![
             &self.period_ms,
             &self.ticks,
             &self.visual_lead_s,
@@ -612,7 +972,23 @@ impl SettingsPanel {
             &self.tick_ms,
             &self.final_ms,
             &self.visual_lead_ms,
-        ]
+            &self.width,
+            &self.corner_radius,
+            &self.padding,
+            &self.line_gap,
+            &self.bar_height,
+            &self.bar_full_scale_ms,
+            &self.time_size,
+            &self.detail_size,
+            &self.caption_size,
+            &self.lead_ms,
+            &self.idle_fps,
+            &self.burst,
+            &self.spacing_ms,
+            &self.cycle_s,
+        ];
+        v.extend(self.screens.iter().map(|(_, n)| &n.inner));
+        v
     }
 
     /// 某個步進器被按了：把值寫回它的文字欄。不是這裡的步進器就回 `false`。
@@ -654,6 +1030,55 @@ impl SettingsPanel {
         self.tick_ms.set(b.tick_ms);
         self.final_ms.set(b.final_ms);
         self.visual_lead_ms.set(b.visual_lead_ms);
+
+        let pn = &theme.panel;
+        self.width.set(pn.width);
+        self.corner_radius.set(pn.corner_radius);
+        self.material.set_index(
+            MATERIALS
+                .iter()
+                .position(|m| *m == pn.material)
+                .unwrap_or(0),
+        );
+        self.appearance.set_index(
+            APPEARANCES
+                .iter()
+                .position(|a| *a == pn.appearance)
+                .unwrap_or(0),
+        );
+        self.opacity.set(pn.opacity);
+        let l = &theme.layout;
+        self.padding.set(l.padding);
+        self.line_gap.set(l.line_gap);
+        self.bar_height.set(l.bar_height);
+        self.bar_full_scale_ms.set(l.bar_full_scale_ms);
+
+        let f = &theme.font;
+        self.family.set(&f.family);
+        self.weight
+            .set_index(WEIGHTS.iter().position(|w| *w == f.weight).unwrap_or(0));
+        self.time_size.set(f.time_size);
+        self.detail_size.set(f.detail_size);
+        self.caption_size.set(f.caption_size);
+        let c = &theme.colors;
+        self.color_time.setColor(&c.time.nscolor());
+        self.color_detail.setColor(&c.detail.nscolor());
+        self.color_caption.setColor(&c.caption.nscolor());
+        self.color_bar.setColor(&c.bar.nscolor());
+        self.color_bar_track.setColor(&c.bar_track.nscolor());
+
+        let d = &theme.display;
+        self.lead_ms.set(d.lead_ms);
+        self.idle_fps.set(d.idle_fps);
+        for (name, field) in &self.screens {
+            field.set(d.screens.get(name).copied(), d.lead_ms);
+        }
+
+        let sy = &theme.sync;
+        self.servers.setStringValue(&ns(&sy.servers.join(", ")));
+        self.burst.set(sy.burst as f64);
+        self.spacing_ms.set(sy.spacing_ms);
+        self.cycle_s.set(sy.cycle_s);
     }
 
     /// 把控制項讀回主題與目標檔。有欄位不是數字就整個不動、回錯誤訊息。
@@ -682,7 +1107,76 @@ impl SettingsPanel {
         b.tick_ms = self.tick_ms.get("前導拍長度")?;
         b.final_ms = self.final_ms.get("歸零拍長度")?;
         b.visual_lead_ms = self.visual_lead_ms.get("畫面比聲音早")?;
+
+        let pn = &mut theme.panel;
+        pn.width = self.width.get("寬")?;
+        pn.corner_radius = self.corner_radius.get("圓角")?;
+        pn.material = MATERIALS[self.material.index().min(MATERIALS.len() - 1)];
+        pn.appearance = APPEARANCES[self.appearance.index().min(APPEARANCES.len() - 1)];
+        pn.opacity = self.opacity.get();
+        let l = &mut theme.layout;
+        l.padding = self.padding.get("內距")?;
+        l.line_gap = self.line_gap.get("行距")?;
+        l.bar_height = self.bar_height.get("長條粗細")?;
+        l.bar_full_scale_ms = self.bar_full_scale_ms.get("長條滿格")?;
+
+        let f = &mut theme.font;
+        f.family = self.family.get();
+        f.weight = WEIGHTS[self.weight.index().min(WEIGHTS.len() - 1)];
+        f.time_size = self.time_size.get("時間字級")?;
+        f.detail_size = self.detail_size.get("細節字級")?;
+        f.caption_size = self.caption_size.get("說明字級")?;
+        let c = &mut theme.colors;
+        c.time = color_of(&self.color_time);
+        c.detail = color_of(&self.color_detail);
+        c.caption = color_of(&self.color_caption);
+        c.bar = color_of(&self.color_bar);
+        c.bar_track = color_of(&self.color_bar_track);
+
+        let d = &mut theme.display;
+        d.lead_ms = self.lead_ms.get("預設提前量")?;
+        d.idle_fps = self.idle_fps.get("平常刷新率")?;
+        for (name, field) in &self.screens {
+            match field.get(name)? {
+                Some(v) => {
+                    d.screens.insert(name.clone(), v);
+                }
+                None => {
+                    d.screens.remove(name);
+                }
+            }
+        }
+
+        let sy = &mut theme.sync;
+        sy.servers = self
+            .servers
+            .stringValue()
+            .to_string()
+            .split(|ch: char| ch.is_whitespace() || ch == ',' || ch == '，' || ch == '、')
+            .filter(|h| !h.is_empty())
+            .map(str::to_string)
+            .collect();
+        sy.burst = self.burst.get("每台幾筆")?.round() as usize;
+        sy.spacing_ms = self.spacing_ms.get("同一台間隔")?;
+        sy.cycle_s = self.cycle_s.get("兩輪之間")?;
+        sy.settings().map_err(|e| format!("時間來源：{e}"))?;
         Ok(())
+    }
+
+    /// 顯示頁那兩行：上次節拍量到的上屏差。
+    pub fn set_present_info(&self, text: &str) {
+        self.present_info.setStringValue(&ns(text));
+    }
+
+    /// 把某台螢幕的提前量欄填成 `ms`；那台不在畫面上就回 `false`。
+    pub fn set_screen_lead(&self, name: &str, ms: f64) -> bool {
+        match self.screens.iter().find(|(n, _)| n == name) {
+            Some((_, field)) => {
+                field.set(Some(ms), ms);
+                true
+            }
+            None => false,
+        }
     }
 
     /// 時間軸頁底下那兩行：實際起跑時刻、鎖定至少提前多久。

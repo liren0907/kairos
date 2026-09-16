@@ -106,6 +106,7 @@ features = [
     "NSEvent",
     "NSFont",
     "NSFontDescriptor",
+    "NSFontManager",
     "NSGraphics",
     "NSGraphicsContext",
     "NSImage",

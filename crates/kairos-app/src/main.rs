@@ -211,7 +211,7 @@ fn build_status_item(
     let sources_header = info_row(mtm, "尚未取樣");
     sources.addItem(&sources_header);
     sources.addItem(&NSMenuItem::separatorItem(mtm));
-    sources.addItem(&info_row(mtm, "改 theme.toml 的 [sync] 會自動套用"));
+    sources.addItem(&info_row(mtm, "在「設定…」的時間來源頁改清單"));
     let sources_item = NSMenuItem::new(mtm);
     sources_item.setTitle(&NSString::from_str("時間來源"));
     sources_item.setSubmenu(Some(&sources));

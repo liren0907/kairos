@@ -46,7 +46,9 @@ use crate::beat_view::StripKind;
 use crate::calibrate::CalibrationRun;
 use crate::glow::Glow;
 use crate::panel::{Face, PanelViews, build_panel};
-use crate::settings_panel::{SettingsPanel, TAB_BEAT, TAB_SOUND, TAB_TIMELINE};
+use crate::settings_panel::{
+    SettingsPanel, TAB_BEAT, TAB_DISPLAY, TAB_FONT, TAB_PANEL, TAB_SOUND, TAB_SYNC, TAB_TIMELINE,
+};
 use crate::settings_store::{self, Settings, clamp_opacity, clamp_zoom};
 use crate::target_panel::TargetPanel;
 use crate::target_store::TargetFile;
@@ -264,8 +266,9 @@ struct State {
     overrides: RefCell<toml::Table>,
     settings_path: PathBuf,
     settings_panel: RefCell<Option<SettingsPanel>>,
-    /// 開發用：設了 `KAIROS_SHOW_SETTINGS` 就在啟動半秒後打開設定視窗（給快照看版面）。
-    settings_pending: Cell<bool>,
+    /// 開發用：設了 `KAIROS_SHOW_SETTINGS`（值是頁碼，0 起算）就在啟動半秒後打開設定視窗
+    /// 並切到那一頁（給快照看版面）。
+    settings_pending: Cell<Option<isize>>,
     /// 面板的大小倍率，記在 `settings.toml` 的 `zoom`。
     zoom: Cell<f64>,
     /// 拖邊緣或捏合中還沒套用的倍率；每 `ZOOM_REBUILD_INTERVAL` 最多重建一次。
@@ -418,6 +421,12 @@ define_class!(
             self.setting_changed();
         }
 
+        /// 顯示頁的「填進這個螢幕」：把上次節拍量到的上屏差填進目前螢幕的提前量。
+        #[unsafe(method(adoptPresentOffset:))]
+        fn adopt_present_offset_action(&self, _sender: Option<&AnyObject>) {
+            self.adopt_present_offset();
+        }
+
         /// 每頁的「回復預設值」，靠 `tag` 分頁。
         #[unsafe(method(resetSettingsTab:))]
         fn reset_settings_tab_action(&self, sender: Option<&AnyObject>) {
@@ -540,7 +549,11 @@ impl Controller {
             overrides: RefCell::new(settings.theme),
             settings_path,
             settings_panel: RefCell::new(None),
-            settings_pending: Cell::new(std::env::var_os("KAIROS_SHOW_SETTINGS").is_some()),
+            settings_pending: Cell::new(
+                std::env::var("KAIROS_SHOW_SETTINGS")
+                    .ok()
+                    .map(|v| v.trim().parse().unwrap_or(0)),
+            ),
             zoom: Cell::new(settings.zoom),
             zoom_pending: Cell::new(None),
             zoom_rebuilt_at: Cell::new(None),
@@ -1506,12 +1519,55 @@ impl Controller {
         let Some(p) = guard.as_ref() else { return };
         let theme = iv.theme.borrow();
         p.fill(&theme, &iv.store.borrow());
+        p.set_present_info(&self.present_info_text());
         let margin = min_lock_margin(&theme);
         p.set_timeline_info(&format!(
             "畫面{}。鎖定至少要提前 {:.1} 秒（起跑加暖機再加 1 秒），填得更晚會自動提早。",
             theme.beat.timeline().describe(),
             margin.as_secs_f64() + 1.0
         ));
+    }
+
+    /// 顯示頁那兩行：上次節拍（Metal 畫法）量到畫面實際上屏比預測晚多少，可以直接填進目前的螢幕。
+    fn present_info_text(&self) -> String {
+        let iv = self.state();
+        let screen = iv.screen_name.borrow().clone();
+        match (iv.last_present_ms.get(), screen) {
+            (Some(ms), Some(name)) => format!(
+                "上次節拍量到畫面實際上屏比預測晚 {ms:+.1} ms（面板現在在「{name}」）。按下面的按鈕就填進那一列。"
+            ),
+            (Some(ms), None) => {
+                format!("上次節拍量到畫面實際上屏比預測晚 {ms:+.1} ms；面板現在不在任何螢幕上。")
+            }
+            (None, _) => "還沒量過：用 Metal 畫法試聽一次節拍，就會量到畫面實際上屏比預測晚多少。"
+                .to_string(),
+        }
+    }
+
+    fn adopt_present_offset(&self) {
+        let iv = self.state();
+        let Some(ms) = iv.last_present_ms.get() else {
+            self.set_settings_status("還沒量過上屏差，先試聽一次節拍");
+            return;
+        };
+        let Some(name) = iv.screen_name.borrow().clone() else {
+            self.set_settings_status("面板現在不在任何螢幕上");
+            return;
+        };
+        let filled = iv
+            .settings_panel
+            .borrow()
+            .as_ref()
+            .is_some_and(|p| p.set_screen_lead(&name, ms.round()));
+        if !filled {
+            self.set_settings_status(&format!("「{name}」不在清單上，重開設定視窗再試"));
+            return;
+        }
+        self.setting_changed();
+        eprintln!(
+            "設定：把量到的上屏差 {:+.0} ms 填進「{name}」的提前量",
+            ms.round()
+        );
     }
 
     fn set_settings_status(&self, text: &str) {
@@ -1533,8 +1589,12 @@ impl Controller {
                 return;
             }
         }
-        self.set_settings_status("已套用");
-        if store != *iv.store.borrow() {
+        let store_changed = store != *iv.store.borrow();
+        let theme_changed = theme != *iv.theme.borrow();
+        if store_changed || theme_changed {
+            self.set_settings_status("已套用");
+        }
+        if store_changed {
             *iv.store.borrow_mut() = store.clone();
             if let Err(e) = store.save(&iv.store_path) {
                 eprintln!("目標：寫入 {} 失敗：{e}", iv.store_path.display());
@@ -1545,7 +1605,7 @@ impl Controller {
             );
             self.rearm_if_pending();
         }
-        if theme != *iv.theme.borrow() {
+        if theme_changed {
             self.commit_theme(theme, "設定");
         }
         if self.session_purpose() != Some(Purpose::Countdown) {
@@ -1594,6 +1654,16 @@ impl Controller {
                 t.beat.final_ms = base.beat.final_ms;
                 t.beat.visual_lead_ms = base.beat.visual_lead_ms;
             }
+            TAB_PANEL => {
+                t.panel = base.panel.clone();
+                t.layout = base.layout.clone();
+            }
+            TAB_FONT => {
+                t.font = base.font.clone();
+                t.colors = base.colors.clone();
+            }
+            TAB_DISPLAY => t.display = base.display.clone(),
+            TAB_SYNC => t.sync = base.sync.clone(),
             _ => return,
         }
         self.set_settings_status("這一頁已回復預設值");
@@ -2146,9 +2216,14 @@ impl Controller {
             iv.calibrate_pending.set(false);
             self.start_calibration();
         }
-        if iv.settings_pending.get() && frame > 30 {
-            iv.settings_pending.set(false);
+        if let Some(tab) = iv.settings_pending.get()
+            && frame > 30
+        {
+            iv.settings_pending.set(None);
             self.show_settings();
+            if let Some(p) = iv.settings_panel.borrow().as_ref() {
+                p.select_tab(tab);
+            }
         }
         self.step_target(&model);
         let shown = iv.smoother.borrow_mut().tick(&model, at);
