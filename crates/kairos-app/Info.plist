@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 版本號（CFBundleShortVersionString、CFBundleVersion）由 scripts/bundle.sh 從 Cargo.toml 與 git 填入，這裡的值只是佔位。 -->
 <plist version="1.0">
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
@@ -8,6 +9,8 @@
 	<string>Kairos</string>
 	<key>CFBundleExecutable</key>
 	<string>kairos</string>
+	<key>CFBundleIconFile</key>
+	<string>Kairos</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.liren.kairos</string>
 	<key>CFBundleInfoDictionaryVersion</key>
@@ -20,6 +23,8 @@
 	<string>0.0.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>LSUIElement</key>

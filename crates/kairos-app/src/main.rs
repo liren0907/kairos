@@ -293,7 +293,7 @@ fn build_status_item(
     let quit = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
-            &NSString::from_str("Quit kairos"),
+            &NSString::from_str("結束 Kairos"),
             Some(sel!(terminate:)),
             &NSString::from_str("q"),
         )
@@ -468,7 +468,7 @@ fn main() {
 
     controller.start();
     eprintln!(
-        "面板已顯示；拖邊緣或捏合改大小、滾輪改不透明度；選單列的碼錶圖示可打開「設定…」、隱藏面板、切換滑鼠穿透、重新載入主題、設目標時刻、校正反應時間、試聽節拍、換節拍樣式，Quit 或 Cmd-Q 結束"
+        "面板已顯示；拖邊緣或捏合改大小、滾輪改不透明度；選單列的碼錶圖示可打開「設定…」、隱藏面板、切換滑鼠穿透、重新載入主題、設目標時刻、校正反應時間、試聽節拍、換節拍樣式，「結束 Kairos」或 Cmd-Q 結束"
     );
 
     app.run();

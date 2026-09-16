@@ -335,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "kairos-app"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "block2",
  "cpal",
@@ -356,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "kairos-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "libc",
  "mach2 0.7.0",

@@ -8,6 +8,7 @@ members = [
 ]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -30,3 +31,8 @@ notify = "8"
 cpal = "0.16"
 objc2-core-audio = "0.3"
 objc2-metal = "0.3"
+
+# 發佈用：去符號、thin LTO；backtrace 沒了但 binary 小一半。
+[profile.release]
+strip = true
+lto = "thin"
