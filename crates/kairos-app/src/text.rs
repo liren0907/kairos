@@ -32,6 +32,22 @@ pub fn system_clock_text(remote_minus_system_ns: i128) -> String {
     }
 }
 
+/// 「還有 14:32」「還有 1:02:03」；已過就是「已過 0:05」。
+pub fn remaining_text(remaining_ns: i128) -> String {
+    let secs = remaining_ns.div_euclid(1_000_000_000);
+    let (word, s) = if secs >= 0 {
+        ("還有", secs)
+    } else {
+        ("已過", -secs)
+    };
+    let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
+    if h > 0 {
+        format!("{word} {h}:{m:02}:{sec:02}")
+    } else {
+        format!("{word} {m}:{sec:02}")
+    }
+}
+
 /// 選單裡的兩列：狀態列與細節列。
 pub fn menu_rows(model: &ClockModel, now: HostTime, system_theta_ns: i128) -> (String, String) {
     let status_word = match status_word(model) {
@@ -105,6 +121,15 @@ mod tests {
             menu_rows(&stale, now, 1_000).0,
             "標準時間 +88.0 ms ± 8.0 ms（過時）"
         );
+    }
+
+    #[test]
+    fn remaining_text_formats_hours_minutes_and_past() {
+        const S: i128 = 1_000_000_000;
+        assert_eq!(remaining_text(872 * S), "還有 14:32");
+        assert_eq!(remaining_text(3_723 * S + 500_000_000), "還有 1:02:03");
+        assert_eq!(remaining_text(-5 * S), "已過 0:05");
+        assert_eq!(remaining_text(0), "還有 0:00");
     }
 
     #[test]

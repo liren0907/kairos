@@ -180,6 +180,41 @@ impl LocalTime {
     }
 }
 
+/// 本地日期加時分秒，給日誌與面板顯示目標時刻用（不是每格都算的路徑）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalDateTime {
+    pub year: i32,
+    pub month: u8,
+    pub day: u8,
+    pub clock: WallClock,
+}
+
+impl LocalDateTime {
+    /// `2026-09-20 12:00:00`。
+    pub fn date_time_string(&self) -> String {
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            self.year, self.month, self.day, self.clock.hour, self.clock.minute, self.clock.second
+        )
+    }
+}
+
+/// 把 Unix 奈秒換成本地日期時間，每次都查 `localtime_r`。
+pub fn local_datetime(unix_ns: i128) -> LocalDateTime {
+    let secs = unix_ns.div_euclid(1_000_000_000) as i64;
+    let t: libc::time_t = secs as libc::time_t;
+    // SAFETY: 同 gmtoff_for。
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let r = unsafe { libc::localtime_r(&t, &mut tm) };
+    let gmtoff = if r.is_null() { 0 } else { tm.tm_gmtoff as i64 };
+    LocalDateTime {
+        year: tm.tm_year + 1900,
+        month: (tm.tm_mon + 1) as u8,
+        day: tm.tm_mday as u8,
+        clock: split_local(unix_ns, gmtoff),
+    }
+}
+
 fn gmtoff_for(unix_secs: i64) -> i64 {
     let t: libc::time_t = unix_secs as libc::time_t;
     // SAFETY: `tm` 全零是合法的初始值；`localtime_r` 只寫入我們提供的結構。
@@ -333,5 +368,23 @@ mod tests {
             (w.hour, w.minute, w.second, w.millis),
             (tm.tm_hour as u8, tm.tm_min as u8, tm.tm_sec as u8, 5)
         );
+    }
+
+    #[test]
+    fn local_datetime_agrees_with_libc_fields() {
+        // 2026-09-16 12:34:56.789 UTC。
+        let unix_ns: i128 = 1_789_562_096 * 1_000_000_000 + 789_000_000;
+        let d = local_datetime(unix_ns);
+        let t: libc::time_t = 1_789_562_096;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        unsafe { libc::localtime_r(&t, &mut tm) };
+        assert_eq!(d.year, tm.tm_year + 1900);
+        assert_eq!(d.month as i32, tm.tm_mon + 1);
+        assert_eq!(d.day as i32, tm.tm_mday);
+        assert_eq!(d.clock.hour as i32, tm.tm_hour);
+        assert_eq!(d.clock.minute as i32, tm.tm_min);
+        assert_eq!(d.clock.second as i32, tm.tm_sec);
+        assert_eq!(d.clock.millis, 789);
+        assert_eq!(d.date_time_string().len(), 19);
     }
 }

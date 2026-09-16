@@ -20,6 +20,7 @@
 use std::fmt;
 use std::io;
 use std::net::SocketAddrV4;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -163,6 +164,10 @@ pub enum SamplerEvent {
     SleepDetected {
         slept: Duration,
     },
+    /// 收到 `pause`：模型已標成 `Frozen`，不再碰網路。
+    Paused,
+    /// 收到 `resume`：狀態已還原，立刻跑一輪。
+    Resumed,
     Published {
         model: ClockModel,
         samples: usize,
@@ -205,6 +210,8 @@ impl fmt::Display for SamplerEvent {
                 result: Err(e),
                 ..
             } => write!(f, "{host}：失敗：{e}"),
+            SamplerEvent::Paused => write!(f, "暫停取樣，模型凍結"),
+            SamplerEvent::Resumed => write!(f, "恢復取樣，立刻跑一輪"),
             SamplerEvent::SleepDetected { slept } => {
                 write!(
                     f,
@@ -245,6 +252,8 @@ enum Command {
 pub struct SamplerHandle {
     slot: ModelSlot,
     commands: mpsc::Sender<Command>,
+    /// 凍結旗標：主執行緒設，執行緒在每一輪前與發布前看。
+    paused: Arc<AtomicBool>,
 }
 
 impl SamplerHandle {
@@ -261,6 +270,29 @@ impl SamplerHandle {
     pub fn resample_now(&self) {
         let _ = self.commands.send(Command::Resample);
     }
+
+    /// 凍結：槽裡的模型**立刻**標成 `Frozen`（在呼叫端的執行緒上做，之後讀到的一定是
+    /// 凍結的那一份），執行緒跑到一半的那一輪不發布、之後不碰網路，直到 [`resume`](Self::resume)。
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+        let mut model = self.slot.get();
+        if model.is_usable() {
+            model.status = ModelStatus::Frozen;
+            self.slot.set(model);
+        }
+        // 叫醒在等週期的執行緒，讓它進入等待、發出 Paused 事件。
+        let _ = self.commands.send(Command::Resample);
+    }
+
+    /// 解凍並立刻跑一輪；模型狀態要等那一輪發布才會從 `Frozen` 變回來。
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        let _ = self.commands.send(Command::Resample);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
 }
 
 /// 啟動取樣執行緒。socket 在呼叫端建立，開不起來就立刻回錯。
@@ -274,6 +306,7 @@ pub fn spawn(
         HostTime::now(),
     ));
     let (tx, rx) = mpsc::channel();
+    let paused = Arc::new(AtomicBool::new(false));
 
     let worker = Worker {
         estimator: IntervalEstimator::new(SourceKind::Standard, config.estimator),
@@ -285,12 +318,17 @@ pub fn spawn(
         round: 0,
         last_success: None,
         woke_since_success: false,
+        paused: paused.clone(),
     };
     thread::Builder::new()
         .name("kairos-sampler".into())
         .spawn(move || worker.run(rx))?;
 
-    Ok(SamplerHandle { slot, commands: tx })
+    Ok(SamplerHandle {
+        slot,
+        commands: tx,
+        paused,
+    })
 }
 
 struct Worker {
@@ -305,6 +343,7 @@ struct Worker {
     last_success: Option<HostTime>,
     /// 睡眠清空之後還沒有拿到新樣本；這段期間發布的是「不可用的 Stale」而不是 Uncalibrated。
     woke_since_success: bool,
+    paused: Arc<AtomicBool>,
 }
 
 /// 一輪的結果：正常結束，或中途睡過、樣本已清空、應該立刻再跑一輪。
@@ -316,6 +355,9 @@ enum CycleOutcome {
 impl Worker {
     fn run(mut self, rx: mpsc::Receiver<Command>) {
         loop {
+            if self.paused.load(Ordering::SeqCst) && !self.wait_while_paused(&rx) {
+                return;
+            }
             if let CycleOutcome::SleptMidCycle = self.cycle() {
                 continue;
             }
@@ -327,6 +369,19 @@ impl Worker {
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
+    }
+
+    /// 凍結期間只等命令、不碰網路；旗標放開就回去立刻跑一輪。
+    /// 回傳 false 代表所有把手都丟掉了，執行緒該退出。
+    fn wait_while_paused(&mut self, rx: &mpsc::Receiver<Command>) -> bool {
+        self.emit(SamplerEvent::Paused);
+        while self.paused.load(Ordering::SeqCst) {
+            if rx.recv().is_err() {
+                return false;
+            }
+        }
+        self.emit(SamplerEvent::Resumed);
+        true
     }
 
     fn emit(&mut self, event: SamplerEvent) {
@@ -376,6 +431,11 @@ impl Worker {
         if let Some(slept) = self.sleep.check() {
             self.invalidate_after_sleep(slept);
             return CycleOutcome::SleptMidCycle;
+        }
+
+        // 這一輪跑到一半被凍結：樣本留著，但不發布，槽裡維持凍結的那一份。
+        if self.paused.load(Ordering::SeqCst) {
+            return CycleOutcome::Published;
         }
 
         let now = HostTime::now();
@@ -525,6 +585,57 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[test]
+    fn pause_freezes_the_model_and_resume_runs_a_cycle() {
+        let (tx, rx) = mpsc::channel();
+        let handle = spawn(
+            loopback_config(),
+            Box::new(move |e| {
+                let _ = tx.send(e);
+            }),
+        )
+        .unwrap();
+        let deadline = Duration::from_secs(5);
+        loop {
+            if let SamplerEvent::Published { .. } = rx.recv_timeout(deadline).unwrap() {
+                break;
+            }
+        }
+        // 放一個可用的模型進槽，暫停後它要立刻變成 Frozen、數值不變。
+        let before = tracking(HostTime::now());
+        handle.slot().set(before);
+        handle.pause();
+        let frozen = handle.model();
+        assert_eq!(frozen.status, ModelStatus::Frozen);
+        assert_eq!(frozen.offset_ns, before.offset_ns);
+        assert!(frozen.is_usable());
+        assert!(handle.is_paused());
+        loop {
+            if let SamplerEvent::Paused = rx.recv_timeout(deadline).unwrap() {
+                break;
+            }
+        }
+        // 凍結期間沒有新的一輪。
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(300)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        handle.resume();
+        let mut resumed = false;
+        loop {
+            match rx.recv_timeout(deadline).unwrap() {
+                SamplerEvent::Resumed => resumed = true,
+                SamplerEvent::Published { model, .. } if resumed => {
+                    assert_ne!(model.status, ModelStatus::Frozen);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_ne!(handle.model().status, ModelStatus::Frozen);
     }
 
     fn tracking(reference: HostTime) -> ClockModel {

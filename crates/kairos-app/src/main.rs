@@ -4,16 +4,20 @@
 //! 階段一：背景取樣執行緒、選單裡的狀態列每秒刷新、睡眠喚醒後立刻重新取樣。
 //! 階段二：浮動面板——毛玻璃、顯示連結每格更新、字形圖集數字、主題熱重載、全域熱鍵。
 //! 階段三：節拍——拍點表、面板節拍區、螢幕邊緣光暈、cpal 滴答聲、每螢幕的顯示提前量。
+//! 階段四：目標時刻——原生目標面板、狀態機自動量測與鎖定、凍結取樣、反應時間校正。
 //!
 //! 這一層只做接線，邏輯都在 `kairos-core` 與各模組。
 
 mod atlas;
 mod audio;
 mod beat_view;
+mod calibrate;
 mod controller;
 mod glow;
 mod hotkey;
 mod panel;
+mod target_panel;
+mod target_store;
 mod text;
 mod theme;
 
@@ -126,6 +130,7 @@ fn build_status_item(
         beat_stop: action_item(mtm, "停止節拍", sel!(stopBeats:), target),
         sound: action_item(mtm, "節拍聲音", sel!(toggleSound:), target),
         glow: action_item(mtm, "邊緣光暈", sel!(toggleGlow:), target),
+        clear_target: action_item(mtm, "解除目標", sel!(clearTarget:), target),
     };
     menu.addItem(&items.panel);
     menu.addItem(&items.click_through);
@@ -133,6 +138,23 @@ fn build_status_item(
         mtm,
         "重新載入主題",
         sel!(reloadTheme:),
+        target,
+    ));
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+    menu.addItem(&action_item(
+        mtm,
+        "目標時刻…",
+        sel!(showTargetPanel:),
+        target,
+    ));
+    items.clear_target.setEnabled(false);
+    menu.addItem(&items.clear_target);
+    menu.addItem(&action_item(mtm, "立刻量測", sel!(measureNow:), target));
+    menu.addItem(&action_item(
+        mtm,
+        "校正反應時間…",
+        sel!(startCalibration:),
         target,
     ));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -251,7 +273,9 @@ fn main() {
             screen.maximumFramesPerSecond()
         );
     }
-    let controller = Controller::new(mtm, sampler.clone(), theme_path);
+    let store_path = target_store::TargetFile::default_path();
+    eprintln!("目標檔：{}", store_path.display());
+    let controller = Controller::new(mtm, sampler.clone(), theme_path, store_path);
 
     let (_status_item, rows, items) = build_status_item(mtm, &controller);
     controller.set_menu_items(items);
@@ -272,7 +296,7 @@ fn main() {
 
     controller.start();
     eprintln!(
-        "面板已顯示；選單列 ⏱ 可隱藏面板、切換滑鼠穿透、重新載入主題、試聽節拍，Quit 或 Cmd-Q 結束"
+        "面板已顯示；選單列 ⏱ 可隱藏面板、切換滑鼠穿透、重新載入主題、設目標時刻、校正反應時間、試聽節拍，Quit 或 Cmd-Q 結束"
     );
 
     app.run();

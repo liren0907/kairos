@@ -150,8 +150,11 @@ pub struct Face {
     bar_h: f64,
     detail: Retained<NSTextField>,
     caption: Retained<NSTextField>,
+    /// 目標時刻那一列，只在有目標時有。
+    target: Option<Retained<NSTextField>>,
     last_detail: String,
     last_caption: String,
+    last_target: String,
 }
 
 impl Face {
@@ -161,6 +164,7 @@ impl Face {
         theme: &Theme,
         scale: f64,
         strip: Option<StripKind>,
+        target_row: bool,
     ) -> Face {
         let time_font_px = theme.font.nsfont(theme.font.time_size * scale);
         let atlas = GlyphAtlas::render(&time_font_px, &theme.colors.time.nscolor(), scale);
@@ -175,8 +179,13 @@ impl Face {
         let gap = theme.layout.line_gap;
         let bar_h = theme.layout.bar_height;
 
-        // 由下往上排。
-        let caption_y = p;
+        // 由下往上排。目標列在最底下，只在有目標時佔位。
+        let target_y = p;
+        let caption_y = if target_row {
+            target_y + caption_h + gap
+        } else {
+            p
+        };
         let bar_y = caption_y + caption_h + gap;
         let detail_y = bar_y + bar_h + gap;
         let digits_y = detail_y + detail_h + gap;
@@ -256,6 +265,15 @@ impl Face {
             caption_h,
         );
 
+        let target = target_row.then(|| {
+            label(
+                &caption_font,
+                &theme.colors.caption.nscolor(),
+                target_y,
+                caption_h,
+            )
+        });
+
         let strip = strip.map(|kind| {
             BeatStrip::build(
                 &views.root_layer,
@@ -282,8 +300,10 @@ impl Face {
             bar_h,
             detail,
             caption,
+            target,
             last_detail: String::new(),
             last_caption: String::new(),
+            last_target: String::new(),
         }
     }
 
@@ -296,6 +316,9 @@ impl Face {
         self.bar_fill.removeFromSuperlayer();
         self.detail.removeFromSuperview();
         self.caption.removeFromSuperview();
+        if let Some(t) = &self.target {
+            t.removeFromSuperview();
+        }
         if let Some(strip) = &self.strip {
             strip.teardown();
         }
@@ -336,6 +359,19 @@ impl Face {
         if self.last_caption != text {
             self.caption.setStringValue(&NSString::from_str(text));
             self.last_caption = text.to_owned();
+        }
+    }
+
+    pub fn has_target_row(&self) -> bool {
+        self.target.is_some()
+    }
+
+    pub fn set_target(&mut self, text: &str) {
+        if let Some(t) = &self.target
+            && self.last_target != text
+        {
+            t.setStringValue(&NSString::from_str(text));
+            self.last_target = text.to_owned();
         }
     }
 }

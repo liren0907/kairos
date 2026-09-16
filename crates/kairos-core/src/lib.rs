@@ -13,6 +13,7 @@
 //! - [`sync`]：背景執行緒定期取樣、算模型、發布到 [`sync::ModelSlot`]；睡眠偵測也在這裡。
 //! - [`display`]：呈現層用的純邏輯——顯示偏移平滑器、本地時分秒拆解。
 //! - [`beat`]：以主機時間表示的拍點表，以及滴答聲與節拍元件的純函數；畫面、聲音、光暈共用同一份表。
+//! - [`target`]：目標時刻模式——提前量公式、待命→量測→鎖定→結束的狀態機、反應時間校正的算術。
 
 pub mod beat;
 pub mod display;
@@ -20,4 +21,5 @@ pub mod estimate;
 pub mod model;
 pub mod source;
 pub mod sync;
+pub mod target;
 pub mod time;
