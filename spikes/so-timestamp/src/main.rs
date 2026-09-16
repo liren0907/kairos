@@ -161,7 +161,12 @@ fn recv_with_kernel_ts(fd: libc::c_int, buf: &mut [u8]) -> io::Result<Recv> {
     }
 }
 
-fn sendto(fd: libc::c_int, payload: &[u8], addr: &libc::sockaddr_storage, addr_len: libc::socklen_t) -> io::Result<()> {
+fn sendto(
+    fd: libc::c_int,
+    payload: &[u8],
+    addr: &libc::sockaddr_storage,
+    addr_len: libc::socklen_t,
+) -> io::Result<()> {
     // SAFETY: 位址結構由呼叫端填妥，長度一致。
     let n = unsafe {
         libc::sendto(
@@ -190,7 +195,9 @@ fn resolve_ipv4(host: &str, port: &str) -> io::Result<(libc::sockaddr_storage, l
         let mut res: *mut libc::addrinfo = ptr::null_mut();
         let rc = libc::getaddrinfo(c_host.as_ptr(), c_port.as_ptr(), &hints, &mut res);
         if rc != 0 {
-            return Err(io::Error::other(format!("getaddrinfo({host}) 失敗，代碼 {rc}")));
+            return Err(io::Error::other(format!(
+                "getaddrinfo({host}) 失敗，代碼 {rc}"
+            )));
         }
         let ai = &*res;
         let mut storage: libc::sockaddr_storage = mem::zeroed();
@@ -220,7 +227,10 @@ fn report(title: &str, tb: Timebase, samples: &[Sample]) {
     let total = samples.len();
     let with_ts: Vec<&Sample> = samples.iter().filter(|s| s.kernel.is_some()).collect();
     let ctrunc = samples.iter().filter(|s| s.ctrunc).count();
-    println!("樣本數 {total}，帶 SCM_TIMESTAMP_MONOTONIC 的 {}，MSG_CTRUNC 的 {ctrunc}", with_ts.len());
+    println!(
+        "樣本數 {total}，帶 SCM_TIMESTAMP_MONOTONIC 的 {}，MSG_CTRUNC 的 {ctrunc}",
+        with_ts.len()
+    );
 
     if with_ts.is_empty() {
         println!("結論：cmsg 沒有出現，這條路徑拿不到核心時間戳。");
@@ -343,7 +353,11 @@ fn ntp_test(tb: Timebase) -> io::Result<()> {
                 println!(
                     "#{i}: 回應 {} 位元組，cmsg {}，往返（user）{:.1} µs，往返（kernel）{}",
                     r.len,
-                    if r.kernel_ticks.is_some() { "有" } else { "無" },
+                    if r.kernel_ticks.is_some() {
+                        "有"
+                    } else {
+                        "無"
+                    },
                     tb.ticks_to_us_f64(rtt_user as i128),
                     rtt_kernel
                         .map(|k| format!("{:.1} µs", tb.ticks_to_us_f64(k)))

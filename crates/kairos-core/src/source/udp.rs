@@ -221,6 +221,9 @@ mod tests {
         let sock = TimestampedUdpSocket::new_ipv4(Duration::from_millis(100)).unwrap();
         let mut buf = [0u8; 16];
         let err = sock.recv(&mut buf).unwrap_err();
-        assert!(matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut));
+        assert!(matches!(
+            err.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
     }
 }

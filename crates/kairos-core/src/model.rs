@@ -116,7 +116,10 @@ mod tests {
     fn uncalibrated_is_not_usable() {
         let m = ClockModel::uncalibrated(SourceKind::Standard, HostTime::from_ticks(0));
         assert!(!m.is_usable());
-        assert_eq!(m.estimate_at(HostTime::from_ticks(123)).half_width_ns, u64::MAX);
+        assert_eq!(
+            m.estimate_at(HostTime::from_ticks(123)).half_width_ns,
+            u64::MAX
+        );
     }
 
     #[test]

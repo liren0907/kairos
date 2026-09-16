@@ -44,7 +44,9 @@ pub fn feasible_vertices(constraints: &[HalfPlane]) -> Vec<(f64, f64)> {
     let mut vertices = Vec::new();
     for (i, p) in constraints.iter().enumerate() {
         for q in &constraints[i + 1..] {
-            let Some((x, y)) = intersect(p, q) else { continue };
+            let Some((x, y)) = intersect(p, q) else {
+                continue;
+            };
             if !x.is_finite() || !y.is_finite() {
                 continue;
             }

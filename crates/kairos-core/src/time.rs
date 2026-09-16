@@ -239,7 +239,10 @@ mod tests {
         let a = HostTime::from_ticks(1_000);
         let b = HostTime::from_ticks(2_000);
         assert!(a < b);
-        assert_eq!(b.checked_duration_since(a), Some(Timebase::get().ticks_to_duration(1_000)));
+        assert_eq!(
+            b.checked_duration_since(a),
+            Some(Timebase::get().ticks_to_duration(1_000))
+        );
         assert_eq!(a.checked_duration_since(b), None);
         assert_eq!(a.saturating_duration_since(b), Duration::ZERO);
         assert_eq!(a - b, Duration::ZERO);

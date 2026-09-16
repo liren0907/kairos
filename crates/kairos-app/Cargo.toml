@@ -16,11 +16,21 @@ kairos-core.workspace = true
 objc2.workspace = true
 block2.workspace = true
 dispatch2.workspace = true
+serde.workspace = true
+toml.workspace = true
+notify.workspace = true
+
+[dependencies.objc2-core-foundation]
+workspace = true
+features = ["CFCGTypes"]
 
 [dependencies.objc2-foundation]
 workspace = true
 features = [
+    "NSAttributedString",
+    "NSData",
     "NSDate",
+    "NSDictionary",
     "NSNotification",
     "NSObjCRuntime",
     "NSObject",
@@ -30,20 +40,54 @@ features = [
     "NSString",
     "NSTimer",
     "block2",
+    "objc2-core-foundation",
+]
+
+[dependencies.objc2-quartz-core]
+workspace = true
+features = [
+    "CADisplayLink",
+    "CAFrameRateRange",
+    "CALayer",
+    "CAMediaTiming",
+    "CATransaction",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
 ]
 
 [dependencies.objc2-app-kit]
 workspace = true
 features = [
+    "NSAppearance",
     "NSApplication",
+    "NSAttributedString",
+    "NSBitmapImageRep",
     "NSButton",
+    "NSCell",
+    "NSColor",
     "NSControl",
+    "NSFont",
+    "NSFontDescriptor",
+    "NSGraphics",
+    "NSGraphicsContext",
+    "NSImage",
+    "NSImageRep",
     "NSMenu",
     "NSMenuItem",
+    "NSPanel",
     "NSResponder",
+    "NSScreen",
     "NSStatusBar",
     "NSStatusBarButton",
     "NSStatusItem",
+    "NSStringDrawing",
+    "NSText",
+    "NSTextField",
     "NSView",
+    "NSVisualEffectView",
+    "NSWindow",
     "NSWorkspace",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+    "objc2-quartz-core",
 ]

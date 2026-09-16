@@ -112,7 +112,9 @@ impl IntervalEstimator {
     }
 
     fn evict_old(&mut self) {
-        let Some(newest) = self.samples.back().map(|s| s.at) else { return };
+        let Some(newest) = self.samples.back().map(|s| s.at) else {
+            return;
+        };
         let cutoff = newest - self.config.window;
         while let Some(front) = self.samples.front() {
             if front.at < cutoff {
@@ -128,7 +130,12 @@ impl IntervalEstimator {
 
     /// 以 `reference` 為 m₀、`theta_ref` 為 θ 的原點，建出所有半平面。
     /// 變數：x ＝ θ₀ − theta_ref（奈秒）、y ＝ ρ（奈秒／秒）。
-    fn constraints(&self, samples: &[Sample], reference: HostTime, theta_ref: i128) -> Vec<HalfPlane> {
+    fn constraints(
+        &self,
+        samples: &[Sample],
+        reference: HostTime,
+        theta_ref: i128,
+    ) -> Vec<HalfPlane> {
         let mut c = Vec::with_capacity(samples.len() * 2 + 2);
         for s in samples {
             let t = s.at.signed_nanos_since(reference) as f64 / 1e9;
@@ -215,7 +222,10 @@ impl IntervalEstimator {
         let mut rejected = 0;
         while !working.is_empty() {
             let reference = working.last().unwrap().at;
-            if self.solve(&working, reference, Self::theta_ref(&working)).is_some() {
+            if self
+                .solve(&working, reference, Self::theta_ref(&working))
+                .is_some()
+            {
                 break;
             }
             self.remove_worst_fit(&mut working);
@@ -357,7 +367,11 @@ mod tests {
         assert_eq!(m.status, ModelStatus::Tracking);
         assert_contains(&m, now, truth(theta0, rho, now));
         // 漂移應被夾在真值附近，遠比先驗 500 ppm 窄。
-        assert!(m.half_width_growth_ns_per_s < 100_000.0, "growth={}", m.half_width_growth_ns_per_s);
+        assert!(
+            m.half_width_growth_ns_per_s < 100_000.0,
+            "growth={}",
+            m.half_width_growth_ns_per_s
+        );
         let drift_ppm = m.drift * 1e6;
         assert!((drift_ppm - 30.0).abs() < m.half_width_growth_ns_per_s / 1_000.0 + 0.1);
         // 往前 60 秒的預測也要含真值。
@@ -375,7 +389,12 @@ mod tests {
             est.push(sample_around(theta, h, 5 * MS, 5 * MS));
             if i % 7 == 3 {
                 // 離群：偏 +5 秒。
-                est.push(sample_around(theta + 5 * NS, h + Duration::from_millis(500), 5 * MS, 5 * MS));
+                est.push(sample_around(
+                    theta + 5 * NS,
+                    h + Duration::from_millis(500),
+                    5 * MS,
+                    5 * MS,
+                ));
             }
         }
         let now = at(20.0 * 30.0);

@@ -308,7 +308,10 @@ mod tests {
 
     #[test]
     fn request_encoding() {
-        let b = NtpRequest { nonce: 0x1122_3344_5566_7788 }.encode();
+        let b = NtpRequest {
+            nonce: 0x1122_3344_5566_7788,
+        }
+        .encode();
         assert_eq!(b.len(), 48);
         assert_eq!(b[0], 0x23);
         assert_eq!(&b[40..48], &0x1122_3344_5566_7788u64.to_be_bytes());
@@ -367,7 +370,10 @@ mod tests {
         let mut b = good;
         b[1] = 0;
         b[12..16].copy_from_slice(b"RATE");
-        assert_eq!(NtpResponse::parse(&b), Err(NtpError::KissOfDeath("RATE".into())));
+        assert_eq!(
+            NtpResponse::parse(&b),
+            Err(NtpError::KissOfDeath("RATE".into()))
+        );
 
         let mut b = good;
         b[1] = 16;
@@ -400,7 +406,10 @@ mod tests {
         assert!((s.hi_ns - (t2 - t1 + err)).abs() <= 1);
         assert!(s.lo_ns < s.hi_ns);
         assert_eq!(ex.round_trip, Duration::from_millis(40));
-        assert_eq!(s.at, HostTime::from_ticks(sent.ticks() / 2 + received.ticks() / 2));
+        assert_eq!(
+            s.at,
+            HostTime::from_ticks(sent.ticks() / 2 + received.ticks() / 2)
+        );
     }
 
     #[test]

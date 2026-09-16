@@ -15,7 +15,11 @@ use kairos_core::source::client::{QueryError, query_burst};
 use kairos_core::source::udp::{TimestampedUdpSocket, resolve_ipv4};
 use kairos_core::time::{HostTime, system_theta_ns};
 
-const SERVERS: &[&str] = &["time.stdtime.gov.tw", "time.google.com", "time.cloudflare.com"];
+const SERVERS: &[&str] = &[
+    "time.stdtime.gov.tw",
+    "time.google.com",
+    "time.cloudflare.com",
+];
 const BURST: usize = 4;
 const SPACING: Duration = Duration::from_secs(1);
 
@@ -67,7 +71,13 @@ fn main() {
     let m = est.model(now);
     let e = m.estimate_at(now);
     println!();
-    println!("模型（{:?}，{} 筆樣本，丟掉 {} 筆，跨度 {:.0} 秒）", m.status, est.len(), est.rejected(), est.span().as_secs_f64());
+    println!(
+        "模型（{:?}，{} 筆樣本，丟掉 {} 筆，跨度 {:.0} 秒）",
+        m.status,
+        est.len(),
+        est.rejected(),
+        est.span().as_secs_f64()
+    );
     println!(
         "  遠端 − 系統時鐘：{:+.3} ms ± {:.3} ms",
         ms(e.remote_unix_ns - (now.as_nanos() as i128 + sys_theta)),

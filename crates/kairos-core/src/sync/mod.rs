@@ -206,7 +206,11 @@ impl fmt::Display for SamplerEvent {
                 ..
             } => write!(f, "{host}：失敗：{e}"),
             SamplerEvent::SleepDetected { slept } => {
-                write!(f, "偵測到睡眠 {:.1} 秒，樣本清空、重新校時", slept.as_secs_f64())
+                write!(
+                    f,
+                    "偵測到睡眠 {:.1} 秒，樣本清空、重新校時",
+                    slept.as_secs_f64()
+                )
             }
             SamplerEvent::Published {
                 model,
@@ -265,7 +269,10 @@ pub fn spawn(
     on_event: Box<dyn FnMut(SamplerEvent) + Send>,
 ) -> io::Result<SamplerHandle> {
     let sock = TimestampedUdpSocket::new_ipv4(config.socket_timeout)?;
-    let slot = ModelSlot::new(ClockModel::uncalibrated(SourceKind::Standard, HostTime::now()));
+    let slot = ModelSlot::new(ClockModel::uncalibrated(
+        SourceKind::Standard,
+        HostTime::now(),
+    ));
     let (tx, rx) = mpsc::channel();
 
     let worker = Worker {
@@ -488,9 +495,12 @@ mod tests {
     #[test]
     fn resample_now_starts_a_new_cycle_before_the_period_ends() {
         let (tx, rx) = mpsc::channel();
-        let handle = spawn(loopback_config(), Box::new(move |e| {
-            let _ = tx.send(e);
-        }))
+        let handle = spawn(
+            loopback_config(),
+            Box::new(move |e| {
+                let _ = tx.send(e);
+            }),
+        )
         .unwrap();
 
         let mut rounds = Vec::new();
@@ -560,13 +570,25 @@ mod tests {
     fn staleness_keeps_numbers_when_samples_are_old() {
         let now = HostTime::from_nanos(1_000_000_000_000);
         let old = now - Duration::from_secs(601);
-        let m = apply_staleness(tracking(now), now, Some(old), Duration::from_secs(600), false);
+        let m = apply_staleness(
+            tracking(now),
+            now,
+            Some(old),
+            Duration::from_secs(600),
+            false,
+        );
         assert_eq!(m.status, ModelStatus::Stale);
         assert!(m.is_usable());
         assert_eq!(m.offset_ns, tracking(now).offset_ns);
 
         let fresh = now - Duration::from_secs(30);
-        let m = apply_staleness(tracking(now), now, Some(fresh), Duration::from_secs(600), false);
+        let m = apply_staleness(
+            tracking(now),
+            now,
+            Some(fresh),
+            Duration::from_secs(600),
+            false,
+        );
         assert_eq!(m.status, ModelStatus::Tracking);
     }
 }

@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::model::SourceKind;
-use crate::source::ntp::{Exchange, NtpError, NtpRequest, NtpResponse, PACKET_LEN, sample_from_exchange};
+use crate::source::ntp::{
+    Exchange, NtpError, NtpRequest, NtpResponse, PACKET_LEN, sample_from_exchange,
+};
 use crate::source::udp::TimestampedUdpSocket;
 
 #[derive(Debug)]
@@ -73,7 +75,12 @@ pub fn query(
     loop {
         let r = match sock.recv(&mut buf) {
             Ok(r) => r,
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
                 return Err(QueryError::NoMatchingResponse);
             }
             Err(e) => return Err(e.into()),
@@ -85,7 +92,13 @@ pub fn query(
         if response.origin.0 != nonce {
             continue;
         }
-        return Ok(sample_from_exchange(source, nonce, sent, r.arrival(), response)?);
+        return Ok(sample_from_exchange(
+            source,
+            nonce,
+            sent,
+            r.arrival(),
+            response,
+        )?);
     }
 }
 

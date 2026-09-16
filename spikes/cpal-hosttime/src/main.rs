@@ -56,7 +56,11 @@ impl Timebase {
 fn signed_diff_ns(a: &StreamInstant, b: &StreamInstant) -> i128 {
     match a.duration_since(b) {
         Some(d) => d.as_nanos() as i128,
-        None => -(b.duration_since(a).map(|d| d.as_nanos() as i128).unwrap_or(0)),
+        None => {
+            -(b.duration_since(a)
+                .map(|d| d.as_nanos() as i128)
+                .unwrap_or(0))
+        }
     }
 }
 
@@ -92,7 +96,10 @@ fn main() {
         supported.buffer_size(),
     );
     if supported.sample_format() != SampleFormat::F32 {
-        println!("此 spike 只處理 F32 輸出格式，實際為 {:?}，結束。", supported.sample_format());
+        println!(
+            "此 spike 只處理 F32 輸出格式，實際為 {:?}，結束。",
+            supported.sample_format()
+        );
         return;
     }
     let config = supported.config();
@@ -144,7 +151,10 @@ fn main() {
 }
 
 fn report(rows: &[Row], sample_rate: u128) {
-    println!("\n收到 {} 筆回呼樣本（略過前 {WARMUP_ROWS} 筆暖機）", rows.len());
+    println!(
+        "\n收到 {} 筆回呼樣本（略過前 {WARMUP_ROWS} 筆暖機）",
+        rows.len()
+    );
     if rows.len() < WARMUP_ROWS + 2 {
         println!("樣本太少，無法判讀。");
         return;
@@ -153,7 +163,10 @@ fn report(rows: &[Row], sample_rate: u128) {
 
     let frames = rows[0].frames;
     let buffer_ns = frames as u128 * 1_000_000_000 / sample_rate;
-    println!("每次回呼 {frames} 幀，緩衝區長度 {:.1} µs", buffer_ns as f64 / 1_000.0);
+    println!(
+        "每次回呼 {frames} 幀，緩衝區長度 {:.1} µs",
+        buffer_ns as f64 / 1_000.0
+    );
 
     let us = |ns: i128| ns as f64 / 1_000.0;
     let stats = |xs: &mut Vec<i128>| {
@@ -192,7 +205,10 @@ fn report(rows: &[Row], sample_rate: u128) {
     );
 
     println!("\n前 10 筆逐筆（µs）：");
-    println!("{:>6} {:>16} {:>20} {:>14}", "幀", "callback−now", "playback−callback", "間隔");
+    println!(
+        "{:>6} {:>16} {:>20} {:>14}",
+        "幀", "callback−now", "playback−callback", "間隔"
+    );
     for r in rows.iter().take(10) {
         println!(
             "{:>6} {:>16.1} {:>20.1} {:>14.1}",
@@ -211,15 +227,21 @@ fn report(rows: &[Row], sample_rate: u128) {
         println!(
             "判讀：callback 穩定領先「現在」約 {ratio_med:.2} 個緩衝區，mHostTime 是呈現時刻（尚未含裝置延遲）；"
         );
-        println!("　　　cpal 的時間基準可用，裝置延遲另查 kAudioDevicePropertyLatency 等屬性補上。");
+        println!(
+            "　　　cpal 的時間基準可用，裝置延遲另查 kAudioDevicePropertyLatency 等屬性補上。"
+        );
     } else if cmn_min.abs() < buffer_ns as i128 / 4 && cmn_max.abs() < buffer_ns as i128 / 4 {
         println!("判讀：callback 與「現在」幾乎重合，mHostTime 是回呼被叫的時刻；");
-        println!("　　　cpal 資訊不足以做取樣點等級的排程，改走 coreaudio-rs 直接拿完整 AudioTimeStamp。");
+        println!(
+            "　　　cpal 資訊不足以做取樣點等級的排程，改走 coreaudio-rs 直接拿完整 AudioTimeStamp。"
+        );
     } else {
         println!("判讀：模式不在預期的兩種之內，需人工檢視上面的數字。");
     }
     if period_jitter_us < 50.0 {
-        println!("附註：callback 間隔抖動 {period_jitter_us:.1} µs，幾乎是取樣時鐘推算出來的，不是排程時刻。");
+        println!(
+            "附註：callback 間隔抖動 {period_jitter_us:.1} µs，幾乎是取樣時鐘推算出來的，不是排程時刻。"
+        );
     } else {
         println!("附註：callback 間隔抖動 {period_jitter_us:.1} µs，帶有排程抖動。");
     }
