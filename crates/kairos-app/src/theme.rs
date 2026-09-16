@@ -450,6 +450,22 @@ pub struct Theme {
 }
 
 impl Theme {
+    /// 幾何全乘 `zoom` 的副本：字級、間距、長條粗細、面板寬與圓角、節拍區高度。
+    /// 顏色、材質、時序、光暈（在螢幕邊緣，跟面板大小無關）都不動。
+    pub fn scaled(&self, zoom: f64) -> Theme {
+        let mut t = self.clone();
+        t.panel.width *= zoom;
+        t.panel.corner_radius *= zoom;
+        t.font.time_size *= zoom;
+        t.font.detail_size *= zoom;
+        t.font.caption_size *= zoom;
+        t.layout.padding *= zoom;
+        t.layout.line_gap *= zoom;
+        t.layout.bar_height *= zoom;
+        t.beat.strip_height *= zoom;
+        t
+    }
+
     pub fn parse(text: &str) -> Result<Theme, toml::de::Error> {
         toml::from_str(text)
     }
@@ -552,6 +568,23 @@ mod tests {
             BeatRenderer::Layer
         );
         assert!(Theme::parse("[beat]\nrenderer = \"vulkan\"\n").is_err());
+    }
+
+    #[test]
+    fn scaled_multiplies_geometry_only() {
+        let t = Theme::default();
+        let s = t.scaled(1.5);
+        assert_eq!(s.panel.width, 480.0);
+        assert_eq!(s.panel.corner_radius, 21.0);
+        assert_eq!(s.font.time_size, 51.0);
+        assert_eq!(s.layout.padding, 24.0);
+        assert_eq!(s.beat.strip_height, 96.0);
+        // 不是幾何的都原樣。
+        assert_eq!(s.panel.opacity, t.panel.opacity);
+        assert_eq!(s.colors, t.colors);
+        assert_eq!(s.beat.period_ms, t.beat.period_ms);
+        assert_eq!(s.beat.glow_width, t.beat.glow_width);
+        assert_eq!(t.scaled(1.0), t);
     }
 
     #[test]

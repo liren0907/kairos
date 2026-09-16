@@ -20,6 +20,7 @@ use kairos_core::display::DIGIT_CELLS;
 use crate::atlas::GlyphAtlas;
 use crate::beat_view::{BeatStrip, StripKind};
 use crate::metal_strip::MetalStrip;
+use crate::state_store::{MAX_ZOOM, MIN_ZOOM};
 use crate::theme::{BeatRenderer, Theme};
 use kairos_core::beat::Phase;
 use kairos_core::time::HostTime;
@@ -66,13 +67,19 @@ pub struct PanelViews {
 
 const FRAME_NAME: &str = "kairos.panel";
 const SCREEN_MARGIN: f64 = 24.0;
+/// 無邊框、不搶焦點、邊緣可拖著改大小；鎖定期間拿掉 `Resizable`。
+const RESIZABLE_MASK: NSWindowStyleMask = NSWindowStyleMask::Borderless
+    .union(NSWindowStyleMask::NonactivatingPanel)
+    .union(NSWindowStyleMask::Resizable);
+const FIXED_MASK: NSWindowStyleMask =
+    NSWindowStyleMask::Borderless.union(NSWindowStyleMask::NonactivatingPanel);
 
 pub fn build_panel(mtm: MainThreadMarker, theme: &Theme) -> PanelViews {
     let rect = CGRect::new(
         CGPoint::new(0.0, 0.0),
         CGSize::new(theme.panel.width, 100.0),
     );
-    let mask = NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel;
+    let mask = RESIZABLE_MASK;
     // `defer` 為 false 讓視窗立刻有 backing store。
     let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
         NSPanel::alloc(mtm),
@@ -138,10 +145,11 @@ pub fn build_panel(mtm: MainThreadMarker, theme: &Theme) -> PanelViews {
 }
 
 impl PanelViews {
-    /// 套用主題裡跟視窗本身有關的部分，並把內容區改成 `width × height`。
+    /// 套用主題裡跟視窗本身有關的部分（不含不透明度，那個走 `set_opacity`），
+    /// 並把內容區改成 `width × height`。`theme` 是已乘過 `zoom` 的副本。
     /// 平常左上角不動；節拍區出現或消失時改成左下角不動，數字才不會跳。
-    pub fn apply_theme(&self, theme: &Theme, height: f64, keep_bottom: bool) {
-        self.panel.setAlphaValue(theme.panel.opacity);
+    /// 使用者正拖著邊緣改大小時不碰視窗大小，只更新長寬比與上下限。
+    pub fn apply_theme(&self, theme: &Theme, height: f64, zoom: f64, keep_bottom: bool) {
         self.panel
             .setAppearance(theme.panel.appearance.ns().as_deref());
         self.effect.setMaterial(theme.panel.material.ns());
@@ -150,14 +158,60 @@ impl PanelViews {
             layer.setMasksToBounds(true);
         }
 
+        // 拖邊緣時 AppKit 照這個比例算高度；倍率上下限換成內容區的大小。
+        let width = theme.panel.width;
+        self.panel.setContentAspectRatio(CGSize::new(width, height));
+        let (base_w, base_h) = (width / zoom, height / zoom);
+        self.panel
+            .setContentMinSize(CGSize::new(base_w * MIN_ZOOM, base_h * MIN_ZOOM));
+        self.panel
+            .setContentMaxSize(CGSize::new(base_w * MAX_ZOOM, base_h * MAX_ZOOM));
+        if self.panel.inLiveResize() {
+            return;
+        }
+
         let f = self.panel.frame();
         let top_left = CGPoint::new(f.origin.x, f.origin.y + f.size.height);
-        self.panel
-            .setContentSize(CGSize::new(theme.panel.width, height));
+        self.panel.setContentSize(CGSize::new(width, height));
         if keep_bottom {
             self.panel.setFrameOrigin(f.origin);
         } else {
             self.panel.setFrameTopLeftPoint(top_left);
+        }
+    }
+
+    pub fn set_opacity(&self, opacity: f64) {
+        self.panel.setAlphaValue(opacity);
+    }
+
+    /// 邊緣能不能拖著改大小。鎖定倒數期間關掉，免得重建面板掉格。
+    pub fn set_resizable(&self, on: bool) {
+        let mask = if on { RESIZABLE_MASK } else { FIXED_MASK };
+        if self.panel.styleMask() != mask {
+            self.panel.setStyleMask(mask);
+        }
+    }
+
+    pub fn in_live_resize(&self) -> bool {
+        self.panel.inLiveResize()
+    }
+
+    /// 目前內容區的寬（點）。拖邊緣時用它反推倍率。
+    pub fn content_width(&self) -> f64 {
+        self.panel
+            .contentRectForFrameRect(self.panel.frame())
+            .size
+            .width
+    }
+
+    /// 放大後可能超出螢幕，把位置夾回來（只動位置，不動大小）。
+    pub fn constrain_to_screen(&self) {
+        let f = self.panel.frame();
+        if let Some(screen) = self.panel.screen() {
+            let c = self.panel.constrainFrameRect_toScreen(f, Some(&screen));
+            if c.origin != f.origin {
+                self.panel.setFrameOrigin(c.origin);
+            }
         }
     }
 
@@ -191,11 +245,13 @@ pub struct Face {
 }
 
 impl Face {
+    /// `theme` 是已乘過 `zoom` 的副本；`zoom` 另外傳給節拍區，球、環、點的尺寸要跟著乘。
     pub fn build(
         mtm: MainThreadMarker,
         views: &PanelViews,
         theme: &Theme,
         scale: f64,
+        zoom: f64,
         strip: Option<StripKind>,
         target_row: bool,
     ) -> Face {
@@ -321,6 +377,7 @@ impl Face {
                         w,
                         strip_h,
                         scale,
+                        zoom,
                     ) {
                         Ok(m) => Some(m),
                         Err(e) => {
@@ -340,6 +397,7 @@ impl Face {
                     y0,
                     w,
                     strip_h,
+                    zoom,
                 )),
             }
         });

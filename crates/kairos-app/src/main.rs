@@ -17,6 +17,7 @@ mod glow;
 mod hotkey;
 mod metal_strip;
 mod panel;
+mod state_store;
 mod target_panel;
 mod target_store;
 mod text;
@@ -129,6 +130,35 @@ fn action_item(
     item
 }
 
+/// 「外觀」子選單：手勢（拖邊緣、捏合、滾輪）是主角，這裡是精確微調與重設。
+fn build_appearance_item(mtm: MainThreadMarker, target: &AnyObject) -> Retained<NSMenuItem> {
+    let menu = NSMenu::new(mtm);
+    menu.setAutoenablesItems(false);
+    menu.addItem(&info_row(mtm, "面板上：拖邊緣或捏合改大小，滾輪改不透明度"));
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    menu.addItem(&action_item(mtm, "放大", sel!(zoomIn:), target));
+    menu.addItem(&action_item(mtm, "縮小", sel!(zoomOut:), target));
+    menu.addItem(&action_item(mtm, "重設大小", sel!(resetZoom:), target));
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    menu.addItem(&action_item(mtm, "更透明", sel!(moreTransparent:), target));
+    menu.addItem(&action_item(
+        mtm,
+        "更不透明",
+        sel!(lessTransparent:),
+        target,
+    ));
+    menu.addItem(&action_item(
+        mtm,
+        "依主題檔的不透明度",
+        sel!(resetOpacity:),
+        target,
+    ));
+    let item = NSMenuItem::new(mtm);
+    item.setTitle(&NSString::from_str("外觀"));
+    item.setSubmenu(Some(&menu));
+    item
+}
+
 /// 「節拍樣式」子選單的四個項目，共用 `setBeatStyle:`，靠 `tag` 分辨：0 依主題檔，之後照
 /// `StripKind::ALL` 的順序。一開始勾「依主題檔」。
 fn build_style_items(
@@ -217,6 +247,7 @@ fn build_status_item(
     style_item.setSubmenu(Some(&style_menu));
     menu.addItem(&items.panel);
     menu.addItem(&items.click_through);
+    menu.addItem(&build_appearance_item(mtm, target));
     menu.addItem(&action_item(
         mtm,
         "重新載入主題",
@@ -379,7 +410,15 @@ fn main() {
     }
     let store_path = target_store::TargetFile::default_path();
     eprintln!("目標檔：{}", store_path.display());
-    let controller = Controller::new(mtm, sampler.clone(), theme, theme_path, store_path);
+    let state_path = state_store::ViewState::default_path();
+    let controller = Controller::new(
+        mtm,
+        sampler.clone(),
+        theme,
+        theme_path,
+        store_path,
+        state_path,
+    );
 
     let (_status_item, rows, items) = build_status_item(mtm, &controller);
     controller.set_menu_items(items);
@@ -400,7 +439,7 @@ fn main() {
 
     controller.start();
     eprintln!(
-        "面板已顯示；選單列的碼錶圖示可隱藏面板、切換滑鼠穿透、重新載入主題、設目標時刻、校正反應時間、試聽節拍、換節拍樣式，Quit 或 Cmd-Q 結束"
+        "面板已顯示；拖邊緣或捏合改大小、滾輪改不透明度；選單列的碼錶圖示可隱藏面板、切換滑鼠穿透、重新載入主題、設目標時刻、校正反應時間、試聽節拍、換節拍樣式，Quit 或 Cmd-Q 結束"
     );
 
     app.run();

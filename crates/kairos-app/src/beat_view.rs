@@ -34,19 +34,53 @@ impl StripKind {
     }
 }
 
-pub(crate) const BALL_DIAMETER: f64 = 14.0;
-pub(crate) const GROUND_WIDTH: f64 = 80.0;
-pub(crate) const GROUND_HEIGHT: f64 = 2.0;
-pub(crate) const GROUND_LIFT: f64 = 10.0;
-pub(crate) const RING_INNER: f64 = 10.0;
-pub(crate) const RING_OUTER_MAX: f64 = 28.0;
-pub(crate) const RING_BORDER: f64 = 2.0;
-pub(crate) const PULSE_DIAMETER: f64 = 18.0;
+/// 節拍元件的尺寸（點）。兩種畫法共用同一組，乘上面板的大小倍率。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct StripMetrics {
+    pub ball_diameter: f64,
+    pub ground_width: f64,
+    pub ground_height: f64,
+    pub ground_lift: f64,
+    pub ring_inner: f64,
+    pub ring_outer_max: f64,
+    pub ring_border: f64,
+    pub pulse_diameter: f64,
+}
+
+impl StripMetrics {
+    /// 倍率 1.0 的尺寸。
+    pub const BASE: StripMetrics = StripMetrics {
+        ball_diameter: 14.0,
+        ground_width: 80.0,
+        ground_height: 2.0,
+        ground_lift: 10.0,
+        ring_inner: 10.0,
+        ring_outer_max: 28.0,
+        ring_border: 2.0,
+        pulse_diameter: 18.0,
+    };
+
+    pub fn scaled(zoom: f64) -> StripMetrics {
+        let b = StripMetrics::BASE;
+        StripMetrics {
+            ball_diameter: b.ball_diameter * zoom,
+            ground_width: b.ground_width * zoom,
+            ground_height: b.ground_height * zoom,
+            ground_lift: b.ground_lift * zoom,
+            ring_inner: b.ring_inner * zoom,
+            ring_outer_max: b.ring_outer_max * zoom,
+            ring_border: b.ring_border * zoom,
+            pulse_diameter: b.pulse_diameter * zoom,
+        }
+    }
+}
+
 /// 歸零拍的放大倍率。
 pub(crate) const FINAL_SCALE: f64 = 1.4;
 
 pub struct BeatStrip {
     kind: StripKind,
+    m: StripMetrics,
     /// 主角：球、外環、或 pulse 的點。
     a: Retained<CALayer>,
     /// 配角：地線、內環；pulse 沒有。
@@ -77,7 +111,8 @@ fn circle(diameter: f64) -> Retained<CALayer> {
 }
 
 impl BeatStrip {
-    /// 在 `parent` 裡、左下角 `(x0, y0)`、大小 `width × height` 的區域建元件。
+    /// 在 `parent` 裡、左下角 `(x0, y0)`、大小 `width × height` 的區域建元件；`zoom` 是面板的大小倍率。
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         parent: &CALayer,
         theme: &Theme,
@@ -86,7 +121,9 @@ impl BeatStrip {
         y0: f64,
         width: f64,
         height: f64,
+        zoom: f64,
     ) -> BeatStrip {
+        let m = StripMetrics::scaled(zoom);
         let color = cg(&theme.beat.color);
         let final_color = cg(&theme.beat.final_color);
         let dim = theme.beat.color;
@@ -95,33 +132,36 @@ impl BeatStrip {
 
         let (a, b, base_y, max_height, outer_radius) = match kind {
             StripKind::Ball => {
-                let ground_top = y0 + GROUND_LIFT + GROUND_HEIGHT;
-                let ball = circle(BALL_DIAMETER);
+                let ground_top = y0 + m.ground_lift + m.ground_height;
+                let ball = circle(m.ball_diameter);
                 ball.setBackgroundColor(Some(&color));
                 let ground = CALayer::new();
                 ground.setFrame(CGRect::new(
-                    CGPoint::new(center_x - GROUND_WIDTH / 2.0, y0 + GROUND_LIFT),
-                    CGSize::new(GROUND_WIDTH, GROUND_HEIGHT),
+                    CGPoint::new(center_x - m.ground_width / 2.0, y0 + m.ground_lift),
+                    CGSize::new(m.ground_width, m.ground_height),
                 ));
-                ground.setCornerRadius(GROUND_HEIGHT / 2.0);
+                ground.setCornerRadius(m.ground_height / 2.0);
                 ground.setBackgroundColor(Some(&color));
                 ground.setOpacity(0.35);
                 let max_height =
-                    (y0 + height - 4.0 - BALL_DIAMETER * FINAL_SCALE - ground_top).max(4.0);
+                    (y0 + height - 4.0 - m.ball_diameter * FINAL_SCALE - ground_top).max(4.0);
                 (ball, Some(ground), ground_top, max_height, 0.0)
             }
             StripKind::Ring => {
-                let outer_r = RING_OUTER_MAX.min(height / 2.0 - 3.0).max(RING_INNER + 2.0);
+                let outer_r = m
+                    .ring_outer_max
+                    .min(height / 2.0 - 3.0)
+                    .max(m.ring_inner + 2.0);
                 let outer = circle(outer_r * 2.0);
-                outer.setBorderWidth(RING_BORDER);
+                outer.setBorderWidth(m.ring_border);
                 outer.setBorderColor(Some(&color));
-                let inner = circle(RING_INNER * 2.0);
-                inner.setBorderWidth(RING_BORDER);
+                let inner = circle(m.ring_inner * 2.0);
+                inner.setBorderWidth(m.ring_border);
                 inner.setBorderColor(Some(&color));
                 (outer, Some(inner), y0 + height / 2.0, 0.0, outer_r)
             }
             StripKind::Pulse => {
-                let dot = circle(PULSE_DIAMETER);
+                let dot = circle(m.pulse_diameter);
                 dot.setBackgroundColor(Some(&color));
                 (dot, None, y0 + height / 2.0, 0.0, 0.0)
             }
@@ -137,6 +177,7 @@ impl BeatStrip {
 
         BeatStrip {
             kind,
+            m,
             a,
             b,
             color,
@@ -202,9 +243,9 @@ impl BeatStrip {
 
     fn inner_radius(&self) -> f64 {
         if self.showing_final {
-            RING_INNER * 1.3
+            self.m.ring_inner * 1.3
         } else {
-            RING_INNER
+            self.m.ring_inner
         }
     }
 
@@ -217,7 +258,7 @@ impl BeatStrip {
         let scale = if is_final { FINAL_SCALE } else { 1.0 };
         match self.kind {
             StripKind::Ball => {
-                let d = BALL_DIAMETER * scale;
+                let d = self.m.ball_diameter * scale;
                 self.a
                     .setBounds(CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(d, d)));
                 self.a.setCornerRadius(d / 2.0);
@@ -239,7 +280,7 @@ impl BeatStrip {
                 }
             }
             StripKind::Pulse => {
-                let d = PULSE_DIAMETER * scale;
+                let d = self.m.pulse_diameter * scale;
                 self.a
                     .setBounds(CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(d, d)));
                 self.a.setCornerRadius(d / 2.0);

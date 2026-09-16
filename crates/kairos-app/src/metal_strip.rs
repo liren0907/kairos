@@ -35,10 +35,7 @@ use kairos_core::beat::Phase;
 use kairos_core::beat::visual::{ball_height, landing_flash, pulse_opacity, ring_radius};
 use kairos_core::time::HostTime;
 
-use crate::beat_view::{
-    BALL_DIAMETER, FINAL_SCALE, GROUND_HEIGHT, GROUND_LIFT, GROUND_WIDTH, PULSE_DIAMETER,
-    RING_BORDER, RING_INNER, RING_OUTER_MAX, StripKind,
-};
+use crate::beat_view::{FINAL_SCALE, StripKind, StripMetrics};
 use crate::theme::{Color, Theme};
 
 /// 片段著色器：`u.a` 是主角圓（球、外環、點），`u.b` 是配角（地線或內環）。
@@ -100,7 +97,10 @@ fragment float4 strip_fragment(V in [[stage_in]], constant U& u [[buffer(0)]]) {
 pub struct StripGeometry {
     pub width: f64,
     pub height: f64,
+    /// 螢幕的 backing scale（點到像素）。
     pub scale: f64,
+    /// 面板的大小倍率，決定球、環、點的尺寸。
+    pub zoom: f64,
 }
 
 /// 傳給著色器的常數，跟 MSL 的 `struct U` 一模一樣：六個 float4，96 位元組。
@@ -134,6 +134,7 @@ pub fn uniforms_for(
     final_color: &Color,
 ) -> Uniforms {
     let s = geo.scale;
+    let m = StripMetrics::scaled(geo.zoom);
     let px = |x: f64| (x * s) as f32;
     let py = |y: f64| ((geo.height - y) * s) as f32;
     let main = if phase.is_final { final_color } else { color };
@@ -154,40 +155,42 @@ pub fn uniforms_for(
     };
     match kind {
         StripKind::Ball => {
-            let ground_top = GROUND_LIFT + GROUND_HEIGHT;
-            let max_height = (geo.height - 4.0 - BALL_DIAMETER * FINAL_SCALE - ground_top).max(4.0);
-            let d = BALL_DIAMETER * if phase.is_final { FINAL_SCALE } else { 1.0 };
+            let ground_top = m.ground_lift + m.ground_height;
+            let max_height =
+                (geo.height - 4.0 - m.ball_diameter * FINAL_SCALE - ground_top).max(4.0);
+            let d = m.ball_diameter * if phase.is_final { FINAL_SCALE } else { 1.0 };
             let h = ball_height(phase, max_height);
             u.a = [px(center_x), py(ground_top + h + d / 2.0), px(d / 2.0), 0.0];
             u.a_color = rgba(main, 1.0);
             u.b = [
                 px(center_x),
-                py(GROUND_LIFT + GROUND_HEIGHT / 2.0),
-                px(GROUND_WIDTH / 2.0),
-                px(GROUND_HEIGHT / 2.0),
+                py(m.ground_lift + m.ground_height / 2.0),
+                px(m.ground_width / 2.0),
+                px(m.ground_height / 2.0),
             ];
             u.b_color = rgba(main, 0.35 + 0.65 * flash);
         }
         StripKind::Ring => {
-            let outer_r = RING_OUTER_MAX
+            let outer_r = m
+                .ring_outer_max
                 .min(geo.height / 2.0 - 3.0)
-                .max(RING_INNER + 2.0);
+                .max(m.ring_inner + 2.0);
             let inner_r = if phase.is_final {
-                RING_INNER * 1.3
+                m.ring_inner * 1.3
             } else {
-                RING_INNER
+                m.ring_inner
             };
             let r = ring_radius(phase, outer_r, inner_r);
             let cy = geo.height / 2.0;
-            u.a = [px(center_x), py(cy), px(r), px(RING_BORDER)];
+            u.a = [px(center_x), py(cy), px(r), px(m.ring_border)];
             u.a_color = rgba(main, 1.0);
-            u.b = [px(center_x), py(cy), px(inner_r), px(RING_BORDER)];
+            u.b = [px(center_x), py(cy), px(inner_r), px(m.ring_border)];
             let flashing = flash > 0.02;
             u.b_color = rgba(main, if flashing { flash } else { 1.0 });
             u.b_fill = rgba(main, if flashing { flash } else { 0.35 });
         }
         StripKind::Pulse => {
-            let d = PULSE_DIAMETER * if phase.is_final { FINAL_SCALE } else { 1.0 };
+            let d = m.pulse_diameter * if phase.is_final { FINAL_SCALE } else { 1.0 };
             u.a = [px(center_x), py(geo.height / 2.0), px(d / 2.0), 0.0];
             u.a_color = rgba(main, pulse_opacity(phase));
         }
@@ -327,6 +330,7 @@ impl MetalStrip {
         width: f64,
         height: f64,
         scale: f64,
+        zoom: f64,
     ) -> Result<MetalStrip, String> {
         let device = MTLCreateSystemDefaultDevice().ok_or("沒有 Metal 裝置")?;
         let queue = device
@@ -391,6 +395,7 @@ impl MetalStrip {
                 width,
                 height,
                 scale,
+                zoom,
             },
             color: theme.beat.color,
             final_color: theme.beat.final_color,
@@ -507,8 +512,11 @@ mod tests {
             width: 288.0,
             height: 64.0,
             scale: 2.0,
+            zoom: 1.0,
         }
     }
+
+    const M: StripMetrics = StripMetrics::BASE;
 
     fn phase(phi: f64, is_final: bool, since_ms: Option<u64>) -> Phase {
         Phase {
@@ -532,21 +540,21 @@ mod tests {
     #[test]
     fn ball_sits_on_the_ground_at_landing_and_flies_mid_beat() {
         let g = geo();
-        let ground_top = GROUND_LIFT + GROUND_HEIGHT;
+        let ground_top = M.ground_lift + M.ground_height;
         let landed = uniforms_for(StripKind::Ball, g, &phase(0.0, false, None), &BLUE, &ORANGE);
         assert_eq!(landed.size_mode, [576.0, 128.0, 0.0, 0.0]);
         // 中心 x 在正中間；y 換成像素、向下：(64 − (12 + 7)) × 2 = 90。
         assert_eq!(landed.a[0], 288.0);
         assert_eq!(
             landed.a[1],
-            ((g.height - (ground_top + BALL_DIAMETER / 2.0)) * 2.0) as f32
+            ((g.height - (ground_top + M.ball_diameter / 2.0)) * 2.0) as f32
         );
-        assert_eq!(landed.a[2], (BALL_DIAMETER / 2.0 * 2.0) as f32);
+        assert_eq!(landed.a[2], (M.ball_diameter / 2.0 * 2.0) as f32);
         assert_eq!(landed.a[3], 0.0);
         assert_eq!(landed.a_color, [0.0, 0.5, 1.0, 1.0]);
         // 地線：沒閃時 35%。
         assert!((landed.b_color[3] - 0.35).abs() < 1e-6);
-        assert_eq!(landed.b[2], (GROUND_WIDTH / 2.0 * 2.0) as f32);
+        assert_eq!(landed.b[2], (M.ground_width / 2.0 * 2.0) as f32);
 
         let flying = uniforms_for(StripKind::Ball, g, &phase(0.5, false, None), &BLUE, &ORANGE);
         assert!(flying.a[1] < landed.a[1], "半拍時球在上面（像素 y 較小）");
@@ -564,7 +572,7 @@ mod tests {
         assert_eq!(final_beat.a_color, [1.0, 0.7, 0.3, 1.0]);
         assert_eq!(
             final_beat.a[2],
-            (BALL_DIAMETER * FINAL_SCALE / 2.0 * 2.0) as f32
+            (M.ball_diameter * FINAL_SCALE / 2.0 * 2.0) as f32
         );
     }
 
@@ -575,8 +583,8 @@ mod tests {
         let end = uniforms_for(StripKind::Ring, g, &phase(1.0, false, None), &BLUE, &ORANGE);
         assert_eq!(start.size_mode[2], 1.0);
         assert!(start.a[2] > end.a[2], "外環從大縮到小");
-        assert_eq!(end.a[2], (RING_INNER * 2.0) as f32);
-        assert_eq!(start.a[3], (RING_BORDER * 2.0) as f32);
+        assert_eq!(end.a[2], (M.ring_inner * 2.0) as f32);
+        assert_eq!(start.a[3], (M.ring_border * 2.0) as f32);
         assert!((start.b_fill[3] - 0.35).abs() < 1e-6);
         assert_eq!(start.b_color[3], 1.0);
 
@@ -591,7 +599,7 @@ mod tests {
         assert_eq!(flash.b_color[3], 1.0);
 
         let final_beat = uniforms_for(StripKind::Ring, g, &phase(0.0, true, None), &BLUE, &ORANGE);
-        assert_eq!(final_beat.b[2], (RING_INNER * 1.3 * 2.0) as f32);
+        assert_eq!(final_beat.b[2], (M.ring_inner * 1.3 * 2.0) as f32);
     }
 
     #[test]
@@ -614,8 +622,25 @@ mod tests {
         assert_eq!(dim.size_mode[2], 2.0);
         assert!((dim.a_color[3] - 0.2).abs() < 1e-6);
         assert!((bright.a_color[3] - 1.0).abs() < 1e-6);
-        assert_eq!(dim.a[2], (PULSE_DIAMETER / 2.0 * 2.0) as f32);
+        assert_eq!(dim.a[2], (M.pulse_diameter / 2.0 * 2.0) as f32);
         assert_eq!(dim.b_color[3], 0.0);
+    }
+
+    #[test]
+    fn zoom_scales_the_shapes() {
+        let mut g = geo();
+        g.zoom = 2.0;
+        let landed = uniforms_for(StripKind::Ball, g, &phase(0.0, false, None), &BLUE, &ORANGE);
+        assert_eq!(landed.a[2], (M.ball_diameter * 2.0 / 2.0 * 2.0) as f32);
+        assert_eq!(landed.b[2], (M.ground_width * 2.0 / 2.0 * 2.0) as f32);
+        let dot = uniforms_for(
+            StripKind::Pulse,
+            g,
+            &phase(0.0, false, None),
+            &BLUE,
+            &ORANGE,
+        );
+        assert_eq!(dot.a[2], (M.pulse_diameter * 2.0 / 2.0 * 2.0) as f32);
     }
 
     #[test]

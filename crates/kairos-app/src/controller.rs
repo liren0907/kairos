@@ -8,6 +8,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -18,9 +19,10 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSBitmapImageFileType, NSControlStateValueOff, NSControlStateValueOn, NSMenuItem,
-    NSWindowDidChangeBackingPropertiesNotification, NSWindowDidChangeScreenNotification,
-    NSWorkspace,
+    NSBitmapImageFileType, NSControlStateValueOff, NSControlStateValueOn, NSEvent, NSEventMask,
+    NSEventPhase, NSEventType, NSMenuItem, NSWindowDidChangeBackingPropertiesNotification,
+    NSWindowDidChangeScreenNotification, NSWindowDidEndLiveResizeNotification,
+    NSWindowDidResizeNotification, NSWorkspace,
 };
 use objc2_foundation::{
     NSDictionary, NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol, NSRunLoop,
@@ -43,6 +45,7 @@ use crate::beat_view::StripKind;
 use crate::calibrate::CalibrationRun;
 use crate::glow::Glow;
 use crate::panel::{Face, PanelViews, build_panel};
+use crate::state_store::{ViewState, clamp_opacity, clamp_zoom};
 use crate::target_panel::TargetPanel;
 use crate::target_store::TargetFile;
 use crate::text::{self, ms, remaining_text, status_word, system_clock_text};
@@ -54,10 +57,48 @@ pub struct Flags {
     pub theme_dirty: AtomicBool,
     pub scale_dirty: AtomicBool,
     pub screen_dirty: AtomicBool,
+    /// 視窗大小變了（含使用者拖邊緣）；主執行緒下一格看是不是拖曳中再決定要不要重建。
+    pub resize_dirty: AtomicBool,
+    /// 使用者放開邊緣。
+    pub live_resize_ended: AtomicBool,
+}
+
+/// 滾輪與捏合的事件監聽只把量累加在這裡，主執行緒下一格再套用；監聽的 block 與控制器共享。
+struct Gestures {
+    /// 實體方向的滾動量：正值＝手指或滾輪往上。觸控板的精確位移以點計、滾輪以行計，分開累加。
+    scroll_points: Cell<f64>,
+    scroll_lines: Cell<f64>,
+    /// 捏合累積的倍率，1.0 代表沒動。
+    magnify: Cell<f64>,
+    magnify_ended: Cell<bool>,
+}
+
+impl Gestures {
+    fn new() -> Gestures {
+        Gestures {
+            scroll_points: Cell::new(0.0),
+            scroll_lines: Cell::new(0.0),
+            magnify: Cell::new(1.0),
+            magnify_ended: Cell::new(false),
+        }
+    }
 }
 
 /// 存檔後等這麼久再讀，讓編輯器把檔案寫完。
 const THEME_RELOAD_DELAY: Duration = Duration::from_millis(150);
+/// 拖邊緣或捏合中最多多久重建一次面板。
+const ZOOM_REBUILD_INTERVAL: Duration = Duration::from_millis(50);
+/// 大小或不透明度改完後等這麼久沒再動才寫 state.toml。
+const STATE_SAVE_DELAY: Duration = Duration::from_millis(300);
+/// 說明列暫時顯示「大小 125% · 不透明度 70%」多久。
+const TOAST_DURATION: Duration = Duration::from_millis(1500);
+/// 選單「放大／縮小」一次乘除多少。
+const ZOOM_STEP: f64 = 1.1;
+/// 選單「更透明／更不透明」一次加減多少。
+const OPACITY_STEP: f64 = 0.1;
+/// 觸控板滾一點改多少不透明度（滿範圍約 200 點）；滾輪一行改 5%。
+const OPACITY_PER_SCROLL_POINT: f64 = 0.004;
+const OPACITY_PER_SCROLL_LINE: f64 = 0.05;
 /// 前幾格印顯示連結的時序，確認提前量與週期。
 const DIAG_FRAMES: usize = 300;
 /// 設了 `KAIROS_SNAPSHOT_DIR` 時，在這幾格把面板離屏渲染成 PNG（沒有毛玻璃，只有內容）；
@@ -219,6 +260,20 @@ struct State {
     glow_on: Cell<bool>,
     /// 選單「節拍樣式」的選擇：`None` 依主題檔；主題檔的 `style` 一改就清掉（最後一次動作為準）。
     style_override: Cell<Option<StripKind>>,
+    /// 面板外觀：大小倍率與不透明度指定（`None` 依主題檔），記在 `state.toml`。
+    state_path: PathBuf,
+    zoom: Cell<f64>,
+    opacity_override: Cell<Option<f64>>,
+    /// 拖邊緣或捏合中還沒套用的倍率；每 `ZOOM_REBUILD_INTERVAL` 最多重建一次。
+    zoom_pending: Cell<Option<f64>>,
+    zoom_rebuilt_at: Cell<Option<HostTime>>,
+    state_dirty_since: Cell<Option<HostTime>>,
+    /// 說明列暫時顯示的文字與開始時刻。
+    toast: RefCell<Option<(String, HostTime)>>,
+    gestures: Rc<Gestures>,
+    _gesture_monitor: RefCell<Option<Retained<AnyObject>>>,
+    _resize_observer: RefCell<Option<Retained<ProtocolObject<dyn NSObjectProtocol>>>>,
+    _live_resize_observer: RefCell<Option<Retained<ProtocolObject<dyn NSObjectProtocol>>>>,
     /// 目標時刻：檔案、狀態機、面板、校正。
     store_path: PathBuf,
     store: RefCell<TargetFile>,
@@ -302,6 +357,36 @@ define_class!(
             self.set_beat_style(choice);
         }
 
+        #[unsafe(method(zoomIn:))]
+        fn zoom_in_action(&self, _sender: Option<&AnyObject>) {
+            self.set_zoom(self.state().zoom.get() * ZOOM_STEP);
+        }
+
+        #[unsafe(method(zoomOut:))]
+        fn zoom_out_action(&self, _sender: Option<&AnyObject>) {
+            self.set_zoom(self.state().zoom.get() / ZOOM_STEP);
+        }
+
+        #[unsafe(method(resetZoom:))]
+        fn reset_zoom_action(&self, _sender: Option<&AnyObject>) {
+            self.set_zoom(1.0);
+        }
+
+        #[unsafe(method(moreTransparent:))]
+        fn more_transparent_action(&self, _sender: Option<&AnyObject>) {
+            self.set_opacity_override(Some(self.effective_opacity() - OPACITY_STEP));
+        }
+
+        #[unsafe(method(lessTransparent:))]
+        fn less_transparent_action(&self, _sender: Option<&AnyObject>) {
+            self.set_opacity_override(Some(self.effective_opacity() + OPACITY_STEP));
+        }
+
+        #[unsafe(method(resetOpacity:))]
+        fn reset_opacity_action(&self, _sender: Option<&AnyObject>) {
+            self.set_opacity_override(None);
+        }
+
         #[unsafe(method(showTargetPanel:))]
         fn show_target_panel_action(&self, _sender: Option<&AnyObject>) {
             self.show_target_panel();
@@ -346,8 +431,17 @@ impl Controller {
         theme: Theme,
         theme_path: PathBuf,
         store_path: PathBuf,
+        state_path: PathBuf,
     ) -> Retained<Self> {
         let views = build_panel(mtm, &theme);
+        let view_state = ViewState::load(&state_path);
+        if view_state != ViewState::default() {
+            eprintln!(
+                "外觀：{}（來自 {}）",
+                view_state.describe(theme.panel.opacity),
+                state_path.display()
+            );
+        }
         let flags = Arc::new(Flags::default());
         let watcher = {
             let flags = flags.clone();
@@ -411,6 +505,17 @@ impl Controller {
             sound_on: Cell::new(true),
             glow_on: Cell::new(true),
             style_override: Cell::new(None),
+            state_path,
+            zoom: Cell::new(view_state.zoom),
+            opacity_override: Cell::new(view_state.opacity),
+            zoom_pending: Cell::new(None),
+            zoom_rebuilt_at: Cell::new(None),
+            state_dirty_since: Cell::new(None),
+            toast: RefCell::new(None),
+            gestures: Rc::new(Gestures::new()),
+            _gesture_monitor: RefCell::new(None),
+            _resize_observer: RefCell::new(None),
+            _live_resize_observer: RefCell::new(None),
             store_path,
             store: RefCell::new(store),
             target: RefCell::new(target),
@@ -481,8 +586,94 @@ impl Controller {
         };
         *iv._screen_observer.borrow_mut() = Some(token);
 
+        let flags = iv.flags.clone();
+        let block = RcBlock::new(move |_n: NonNull<NSNotification>| {
+            flags.resize_dirty.store(true, Ordering::SeqCst);
+        });
+        // SAFETY: 同上。
+        let token = unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(NSWindowDidResizeNotification),
+                Some(&iv.views.panel),
+                None,
+                &block,
+            )
+        };
+        *iv._resize_observer.borrow_mut() = Some(token);
+
+        let flags = iv.flags.clone();
+        let block = RcBlock::new(move |_n: NonNull<NSNotification>| {
+            flags.live_resize_ended.store(true, Ordering::SeqCst);
+        });
+        // SAFETY: 同上。
+        let token = unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(NSWindowDidEndLiveResizeNotification),
+                Some(&iv.views.panel),
+                None,
+                &block,
+            )
+        };
+        *iv._live_resize_observer.borrow_mut() = Some(token);
+
+        self.install_gesture_monitor();
         iv.views.panel.orderFrontRegardless();
         self.refresh_screen(true);
+    }
+
+    /// 面板上的滾輪（不透明度）與捏合（大小）。本地事件監聽只看本程式的事件、不需要權限；
+    /// 只吃時鐘面板上的事件（目標面板的日期選擇器照常滾），吃掉的事件不再往下送。
+    fn install_gesture_monitor(&self) {
+        let iv = self.state();
+        let gestures = Rc::clone(&iv.gestures);
+        let panel_number = iv.views.panel.windowNumber();
+        let block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
+            // SAFETY: AppKit 交來的事件指標在 block 執行期間有效。
+            let e = unsafe { event.as_ref() };
+            if e.windowNumber() != panel_number {
+                return event.as_ptr();
+            }
+            match e.r#type() {
+                NSEventType::ScrollWheel => {
+                    // 慣性滾動不算，免得一甩就滑到底。
+                    if e.momentumPhase() != NSEventPhase::None {
+                        return std::ptr::null_mut();
+                    }
+                    // 換算成實體方向：手指或滾輪往上是正。
+                    let dy = e.scrollingDeltaY();
+                    let physical = if e.isDirectionInvertedFromDevice() {
+                        -dy
+                    } else {
+                        dy
+                    };
+                    let cell = if e.hasPreciseScrollingDeltas() {
+                        &gestures.scroll_points
+                    } else {
+                        &gestures.scroll_lines
+                    };
+                    cell.set(cell.get() + physical);
+                    std::ptr::null_mut()
+                }
+                NSEventType::Magnify => {
+                    gestures
+                        .magnify
+                        .set(gestures.magnify.get() * (1.0 + e.magnification()));
+                    if e.phase()
+                        .intersects(NSEventPhase::Ended | NSEventPhase::Cancelled)
+                    {
+                        gestures.magnify_ended.set(true);
+                    }
+                    std::ptr::null_mut()
+                }
+                _ => event.as_ptr(),
+            }
+        });
+        let mask = NSEventMask::ScrollWheel | NSEventMask::Magnify;
+        // SAFETY: block 的簽名跟 AppKit 要的一樣；回傳原事件代表放行、null 代表吃掉。
+        match unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &block) } {
+            Some(monitor) => *iv._gesture_monitor.borrow_mut() = Some(monitor),
+            None => eprintln!("外觀：裝不上滾輪與捏合的監聽，面板上只能拖邊緣改大小"),
+        }
     }
 
     /// 重查面板在哪個螢幕：名稱決定顯示提前量，最高刷新率決定節拍期間要多快。
@@ -538,10 +729,12 @@ impl Controller {
         }
         let strip = iv.beat.borrow().as_ref().map(|s| s.kind);
         let target_row = iv.target.borrow().is_some();
-        let theme = iv.theme.borrow();
+        let zoom = iv.zoom.get();
+        let theme = iv.theme.borrow().scaled(zoom);
         let scale = iv.views.scale();
-        let face = Face::build(mtm, &iv.views, &theme, scale, strip, target_row);
-        iv.views.apply_theme(&theme, face.height, keep_bottom);
+        let face = Face::build(mtm, &iv.views, &theme, scale, zoom, strip, target_row);
+        iv.views.apply_theme(&theme, face.height, zoom, keep_bottom);
+        iv.views.set_opacity(self.effective_opacity());
         *iv.face.borrow_mut() = Some(face);
         iv.caption_second.set(None);
         if let Some(link) = iv.link.borrow().as_ref() {
@@ -565,7 +758,13 @@ impl Controller {
                 }
                 let sync_changed = iv.theme.borrow().sync != new.sync;
                 let style_changed = iv.theme.borrow().beat.style != new.beat.style;
+                let opacity_changed = iv.theme.borrow().panel.opacity != new.panel.opacity;
                 *iv.theme.borrow_mut() = new;
+                if opacity_changed && iv.opacity_override.replace(None).is_some() {
+                    // 最後一次動作為準：主題檔改了不透明度，滾輪或選單的指定就作廢。
+                    eprintln!("主題：[panel] opacity 有變，不透明度的指定作廢，回到依主題檔");
+                    self.mark_state_dirty();
+                }
                 if style_changed {
                     // 最後一次動作為準：主題檔改了樣式，選單的指定就作廢。
                     let had_override = iv.style_override.replace(None).is_some();
@@ -771,6 +970,11 @@ impl Controller {
             fps: iv.screen_fps.get(),
             callback_late_ms: Vec::with_capacity(512),
         });
+        if purpose == Purpose::Countdown {
+            // 倒數期間不重建面板：邊緣拉不動，捏合與選單也擋掉（見 set_zoom）。
+            iv.views.set_resizable(false);
+            iv.zoom_pending.set(None);
+        }
         self.rebuild_face(true);
         self.refresh_menu();
         eprintln!("{summary}");
@@ -842,6 +1046,7 @@ impl Controller {
         let purpose = session.purpose;
         let plan = session.plan;
         drop(session);
+        iv.views.set_resizable(true);
         self.rebuild_face(true);
 
         match purpose {
@@ -999,6 +1204,131 @@ impl Controller {
                     NSControlStateValueOff
                 });
             }
+        }
+    }
+
+    // ---------- 外觀：大小與不透明度 ----------
+
+    fn view_state(&self) -> ViewState {
+        let iv = self.state();
+        ViewState {
+            zoom: iv.zoom.get(),
+            opacity: iv.opacity_override.get(),
+        }
+    }
+
+    /// 現在該套的不透明度：有指定就指定，否則主題檔。
+    fn effective_opacity(&self) -> f64 {
+        let iv = self.state();
+        iv.opacity_override
+            .get()
+            .unwrap_or_else(|| iv.theme.borrow().panel.opacity)
+    }
+
+    fn describe_view(&self) -> String {
+        let theme_opacity = self.state().theme.borrow().panel.opacity;
+        self.view_state().describe(theme_opacity)
+    }
+
+    /// 說明列暫時顯示一句話，蓋過平常的「標準時間（NTP）· …」。
+    fn show_toast(&self, text: String) {
+        *self.state().toast.borrow_mut() = Some((text, HostTime::now()));
+    }
+
+    fn mark_state_dirty(&self) {
+        self.state().state_dirty_since.set(Some(HostTime::now()));
+    }
+
+    /// 選單或程式指定倍率；拖邊緣與捏合走 `zoom_pending`。鎖定倒數期間不改。
+    pub fn set_zoom(&self, zoom: f64) {
+        let iv = self.state();
+        if self.session_purpose() == Some(Purpose::Countdown) {
+            self.show_toast("鎖定中不改大小".to_string());
+            return;
+        }
+        iv.zoom_pending.set(Some(clamp_zoom(zoom)));
+        self.service_zoom(true);
+    }
+
+    /// 不透明度：`None` 回到依主題檔。只是一行 alpha，節拍與鎖定期間都照改。
+    pub fn set_opacity_override(&self, opacity: Option<f64>) {
+        let iv = self.state();
+        iv.opacity_override.set(opacity.map(clamp_opacity));
+        iv.views.set_opacity(self.effective_opacity());
+        self.show_toast(self.describe_view());
+        self.mark_state_dirty();
+    }
+
+    /// 把累加的滾動量換成不透明度、捏合量換成待套用的倍率。
+    fn service_gestures(&self) {
+        let iv = self.state();
+        let points = iv.gestures.scroll_points.replace(0.0);
+        let lines = iv.gestures.scroll_lines.replace(0.0);
+        let delta = points * OPACITY_PER_SCROLL_POINT + lines * OPACITY_PER_SCROLL_LINE;
+        if delta != 0.0 {
+            self.set_opacity_override(Some(self.effective_opacity() + delta));
+        }
+        let magnify = iv.gestures.magnify.replace(1.0);
+        if magnify != 1.0 {
+            if self.session_purpose() == Some(Purpose::Countdown) {
+                self.show_toast("鎖定中不改大小".to_string());
+            } else {
+                let base = iv.zoom_pending.get().unwrap_or(iv.zoom.get());
+                iv.zoom_pending.set(Some(clamp_zoom(base * magnify)));
+            }
+        }
+    }
+
+    /// 套用待套用的倍率：拖曳或捏合中每 `ZOOM_REBUILD_INTERVAL` 最多重建一次；
+    /// `settle`（放手）時立刻套、把視窗大小校準到內容、夾回螢幕、排存檔。
+    fn service_zoom(&self, settle: bool) {
+        let iv = self.state();
+        let Some(zoom) = iv.zoom_pending.get() else {
+            return;
+        };
+        let due = settle
+            || iv
+                .zoom_rebuilt_at
+                .get()
+                .is_none_or(|t| t.elapsed() >= ZOOM_REBUILD_INTERVAL);
+        if !due {
+            return;
+        }
+        iv.zoom_pending.set(None);
+        let changed = (zoom - iv.zoom.get()).abs() > 1e-4;
+        if changed {
+            iv.zoom.set(zoom);
+            self.rebuild_face(false);
+            iv.zoom_rebuilt_at.set(Some(HostTime::now()));
+            self.show_toast(self.describe_view());
+        }
+        if settle {
+            if !changed && !iv.views.in_live_resize() {
+                // 拖曳中重建時沒動視窗大小；放手後把大小校準到內容。
+                let height = iv.face.borrow().as_ref().map(|f| f.height);
+                if let Some(height) = height {
+                    let theme = iv.theme.borrow().scaled(zoom);
+                    iv.views.apply_theme(&theme, height, zoom, false);
+                }
+            }
+            iv.views.constrain_to_screen();
+            self.mark_state_dirty();
+        }
+    }
+
+    /// 大小或不透明度改完、沒再動 `STATE_SAVE_DELAY` 後寫 state.toml。
+    fn service_state_save(&self) {
+        let iv = self.state();
+        let Some(since) = iv.state_dirty_since.get() else {
+            return;
+        };
+        if since.elapsed() < STATE_SAVE_DELAY {
+            return;
+        }
+        iv.state_dirty_since.set(None);
+        match self.view_state().save(&iv.state_path) {
+            Ok(()) => eprintln!("外觀：{}，已記在 state.toml", self.describe_view()),
+            Err(e) => eprintln!("外觀：{} 寫入失敗：{e}", iv.state_path.display()),
         }
     }
 
@@ -1444,6 +1774,19 @@ impl Controller {
         if iv.flags.screen_dirty.swap(false, Ordering::SeqCst) {
             self.refresh_screen(false);
         }
+        self.service_gestures();
+        // 拖邊緣：視窗大小由 AppKit 改，我們只反推倍率；放手時再算一次最終寬度。
+        let ended = iv.flags.live_resize_ended.swap(false, Ordering::SeqCst);
+        if (iv.flags.resize_dirty.swap(false, Ordering::SeqCst) && iv.views.in_live_resize())
+            || ended
+        {
+            let base_width = iv.theme.borrow().panel.width;
+            iv.zoom_pending
+                .set(Some(clamp_zoom(iv.views.content_width() / base_width)));
+        }
+        let settle = ended || iv.gestures.magnify_ended.replace(false);
+        self.service_zoom(settle);
+        self.service_state_save();
         if self.session_purpose() == Some(Purpose::Countdown) {
             return;
         }
@@ -1555,6 +1898,16 @@ impl Controller {
                 {
                     p.set_status(&status);
                 }
+            }
+        }
+        // 暫時文字蓋過說明列；到期就讓下一格重算平常的說明。
+        let toast = iv.toast.borrow().clone();
+        if let Some((text, since)) = toast {
+            if since.elapsed() < TOAST_DURATION {
+                face.set_caption(&text);
+            } else {
+                *iv.toast.borrow_mut() = None;
+                iv.caption_second.set(None);
             }
         }
 
