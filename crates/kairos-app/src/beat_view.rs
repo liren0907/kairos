@@ -31,16 +31,16 @@ impl StripKind {
     }
 }
 
-const BALL_DIAMETER: f64 = 14.0;
-const GROUND_WIDTH: f64 = 80.0;
-const GROUND_HEIGHT: f64 = 2.0;
-const GROUND_LIFT: f64 = 10.0;
-const RING_INNER: f64 = 10.0;
-const RING_OUTER_MAX: f64 = 28.0;
-const RING_BORDER: f64 = 2.0;
-const PULSE_DIAMETER: f64 = 18.0;
+pub(crate) const BALL_DIAMETER: f64 = 14.0;
+pub(crate) const GROUND_WIDTH: f64 = 80.0;
+pub(crate) const GROUND_HEIGHT: f64 = 2.0;
+pub(crate) const GROUND_LIFT: f64 = 10.0;
+pub(crate) const RING_INNER: f64 = 10.0;
+pub(crate) const RING_OUTER_MAX: f64 = 28.0;
+pub(crate) const RING_BORDER: f64 = 2.0;
+pub(crate) const PULSE_DIAMETER: f64 = 18.0;
 /// 歸零拍的放大倍率。
-const FINAL_SCALE: f64 = 1.4;
+pub(crate) const FINAL_SCALE: f64 = 1.4;
 
 pub struct BeatStrip {
     kind: StripKind,

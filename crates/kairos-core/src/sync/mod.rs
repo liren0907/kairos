@@ -143,11 +143,173 @@ impl Default for SamplerConfig {
     }
 }
 
+/// 執行中可以改的那幾個設定：伺服器清單與取樣節奏。估計器、逾時、睡眠門檻不開放。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncSettings {
+    pub servers: Vec<String>,
+    pub burst: usize,
+    pub spacing: Duration,
+    pub cycle: Duration,
+}
+
+impl SyncSettings {
+    pub const MAX_SERVERS: usize = 8;
+    pub const MAX_BURST: usize = 8;
+    pub const MIN_SPACING: Duration = Duration::from_millis(200);
+    pub const MIN_CYCLE: Duration = Duration::from_secs(60);
+
+    /// 建構時驗證：1 到 8 台、每輪 1 到 8 筆、間隔 ≥ 200 ms、週期 ≥ 60 秒，主機名不能空白。
+    pub fn new(
+        servers: Vec<String>,
+        burst: usize,
+        spacing: Duration,
+        cycle: Duration,
+    ) -> Result<SyncSettings, String> {
+        let servers: Vec<String> = servers.into_iter().map(|s| s.trim().to_string()).collect();
+        if servers.is_empty() || servers.len() > Self::MAX_SERVERS {
+            return Err(format!(
+                "伺服器要 1 到 {} 台，現在 {} 台",
+                Self::MAX_SERVERS,
+                servers.len()
+            ));
+        }
+        if let Some(bad) = servers
+            .iter()
+            .find(|s| s.is_empty() || s.chars().any(char::is_whitespace))
+        {
+            return Err(format!("伺服器主機名 {bad:?} 不合法"));
+        }
+        if burst == 0 || burst > Self::MAX_BURST {
+            return Err(format!("每輪筆數要 1 到 {}，現在 {burst}", Self::MAX_BURST));
+        }
+        if spacing < Self::MIN_SPACING {
+            return Err(format!(
+                "同一台兩筆的間隔至少 {} ms，現在 {} ms",
+                Self::MIN_SPACING.as_millis(),
+                spacing.as_millis()
+            ));
+        }
+        if cycle < Self::MIN_CYCLE {
+            return Err(format!(
+                "兩輪的間隔至少 {} 秒，現在 {} 秒",
+                Self::MIN_CYCLE.as_secs(),
+                cycle.as_secs()
+            ));
+        }
+        Ok(SyncSettings {
+            servers,
+            burst,
+            spacing,
+            cycle,
+        })
+    }
+
+    pub fn from_config(config: &SamplerConfig) -> SyncSettings {
+        SyncSettings {
+            servers: config.servers.clone(),
+            burst: config.burst,
+            spacing: config.spacing,
+            cycle: config.cycle,
+        }
+    }
+}
+
+impl SamplerConfig {
+    pub fn apply(&mut self, settings: &SyncSettings) {
+        self.servers = settings.servers.clone();
+        self.burst = settings.burst;
+        self.spacing = settings.spacing;
+        self.cycle = settings.cycle;
+    }
+}
+
+/// 一台伺服器的近況，給選單的「時間來源」子選單看。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ServerStats {
+    pub host: String,
+    /// 最近一次解析到的位址。
+    pub addr: Option<SocketAddrV4>,
+    pub ok: u64,
+    pub failed: u64,
+    pub last_round_trip: Option<Duration>,
+    pub last_half_width_ns: Option<u64>,
+    pub last_stratum: Option<u8>,
+    pub last_reference_id: Option<String>,
+    /// 最近一次失敗的原因；成功之後清掉。
+    pub last_error: Option<String>,
+    /// 最近一次成功或失敗的時刻。
+    pub last_at: Option<HostTime>,
+    pub last_success_at: Option<HostTime>,
+}
+
+impl ServerStats {
+    pub fn new(host: &str) -> ServerStats {
+        ServerStats {
+            host: host.to_string(),
+            addr: None,
+            ok: 0,
+            failed: 0,
+            last_round_trip: None,
+            last_half_width_ns: None,
+            last_stratum: None,
+            last_reference_id: None,
+            last_error: None,
+            last_at: None,
+            last_success_at: None,
+        }
+    }
+
+    fn record_ok(&mut self, ex: &Exchange, now: HostTime) {
+        self.ok += 1;
+        self.last_round_trip = Some(ex.round_trip);
+        self.last_half_width_ns = Some(ex.sample.half_width_ns());
+        self.last_stratum = Some(ex.response.stratum);
+        self.last_reference_id = Some(ex.response.reference_id_string());
+        self.last_error = None;
+        self.last_at = Some(now);
+        self.last_success_at = Some(now);
+    }
+
+    fn record_failure(&mut self, error: String, now: HostTime) {
+        self.failed += 1;
+        self.last_error = Some(error);
+        self.last_at = Some(now);
+    }
+}
+
+/// 取樣執行緒的整體近況：每台伺服器、視窗裡的樣本數、丟掉幾筆、第幾輪。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SyncStatus {
+    pub servers: Vec<ServerStats>,
+    pub samples: usize,
+    pub rejected: usize,
+    pub round: u64,
+    pub settings: Option<SyncSettings>,
+}
+
+/// 取樣執行緒寫、選單讀的近況槽。
+#[derive(Clone, Debug, Default)]
+pub struct StatusSlot(Arc<Mutex<SyncStatus>>);
+
+impl StatusSlot {
+    pub fn get(&self) -> SyncStatus {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn set(&self, status: SyncStatus) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = status;
+    }
+}
+
 /// 取樣執行緒對外的事件，給記錄與日後的設定視窗用。
 #[derive(Debug)]
 pub enum SamplerEvent {
     CycleStarted {
         round: u64,
+    },
+    /// 收到新的設定，已換上、接著立刻跑一輪。
+    Reconfigured {
+        servers: Vec<String>,
     },
     ResolveFailed {
         host: String,
@@ -184,6 +346,9 @@ impl fmt::Display for SamplerEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SamplerEvent::CycleStarted { round } => write!(f, "第 {round} 輪取樣"),
+            SamplerEvent::Reconfigured { servers } => {
+                write!(f, "換上新設定：{}，立刻跑一輪", servers.join("、"))
+            }
             SamplerEvent::ResolveFailed { host, error } => write!(f, "{host}：解析失敗：{error}"),
             SamplerEvent::Exchange {
                 host,
@@ -245,12 +410,14 @@ impl fmt::Display for SamplerEvent {
 
 enum Command {
     Resample,
+    Reconfigure(SyncSettings),
 }
 
 /// 取樣執行緒的控制把手。可以複製；所有把手都丟掉後，執行緒在當輪結束時退出。
 #[derive(Clone)]
 pub struct SamplerHandle {
     slot: ModelSlot,
+    status: StatusSlot,
     commands: mpsc::Sender<Command>,
     /// 凍結旗標：主執行緒設，執行緒在每一輪前與發布前看。
     paused: Arc<AtomicBool>,
@@ -266,9 +433,20 @@ impl SamplerHandle {
         &self.slot
     }
 
+    /// 每台伺服器的近況快照。
+    pub fn status(&self) -> SyncStatus {
+        self.status.get()
+    }
+
     /// 不等週期到，立刻跑下一輪。執行緒已退出時靜默忽略。
     pub fn resample_now(&self) {
         let _ = self.commands.send(Command::Resample);
+    }
+
+    /// 換伺服器清單與節奏：沒凍結就立刻換上並跑一輪；凍結中先記著，解凍那一輪前套用。
+    /// 舊伺服器的樣本留著讓視窗自然老化。
+    pub fn reconfigure(&self, settings: SyncSettings) {
+        let _ = self.commands.send(Command::Reconfigure(settings));
     }
 
     /// 凍結：槽裡的模型**立刻**標成 `Frozen`（在呼叫端的執行緒上做，之後讀到的一定是
@@ -307,6 +485,13 @@ pub fn spawn(
     ));
     let (tx, rx) = mpsc::channel();
     let paused = Arc::new(AtomicBool::new(false));
+    let status = StatusSlot::default();
+    let stats: Vec<ServerStats> = config.servers.iter().map(|h| ServerStats::new(h)).collect();
+    status.set(SyncStatus {
+        servers: stats.clone(),
+        settings: Some(SyncSettings::from_config(&config)),
+        ..SyncStatus::default()
+    });
 
     let worker = Worker {
         estimator: IntervalEstimator::new(SourceKind::Standard, config.estimator),
@@ -314,6 +499,9 @@ pub fn spawn(
         config,
         sock,
         slot: slot.clone(),
+        status: status.clone(),
+        stats,
+        pending: None,
         on_event,
         round: 0,
         last_success: None,
@@ -326,6 +514,7 @@ pub fn spawn(
 
     Ok(SamplerHandle {
         slot,
+        status,
         commands: tx,
         paused,
     })
@@ -337,6 +526,11 @@ struct Worker {
     estimator: IntervalEstimator,
     sleep: SleepDetector,
     slot: ModelSlot,
+    status: StatusSlot,
+    /// 與 `config.servers` 同順序。
+    stats: Vec<ServerStats>,
+    /// 收到但還沒套用的設定（凍結中收到的會等到解凍）。
+    pending: Option<SyncSettings>,
     on_event: Box<dyn FnMut(SamplerEvent) + Send>,
     round: u64,
     /// 最近一筆成功樣本的時刻。
@@ -358,16 +552,28 @@ impl Worker {
             if self.paused.load(Ordering::SeqCst) && !self.wait_while_paused(&rx) {
                 return;
             }
+            self.apply_pending();
             if let CycleOutcome::SleptMidCycle = self.cycle() {
                 continue;
             }
             match rx.recv_timeout(self.config.cycle) {
-                Ok(Command::Resample) | Err(RecvTimeoutError::Timeout) => {
-                    // 排隊的多個要求合併成一輪。
-                    while rx.try_recv().is_ok() {}
+                Ok(command) => {
+                    self.absorb(command);
+                    // 排隊的多個要求合併成一輪；設定以最後一份為準。
+                    while let Ok(c) = rx.try_recv() {
+                        self.absorb(c);
+                    }
                 }
+                Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
             }
+        }
+    }
+
+    fn absorb(&mut self, command: Command) {
+        match command {
+            Command::Resample => {}
+            Command::Reconfigure(settings) => self.pending = Some(settings),
         }
     }
 
@@ -376,12 +582,46 @@ impl Worker {
     fn wait_while_paused(&mut self, rx: &mpsc::Receiver<Command>) -> bool {
         self.emit(SamplerEvent::Paused);
         while self.paused.load(Ordering::SeqCst) {
-            if rx.recv().is_err() {
-                return false;
+            match rx.recv() {
+                Ok(command) => self.absorb(command),
+                Err(_) => return false,
             }
         }
         self.emit(SamplerEvent::Resumed);
         true
+    }
+
+    /// 換上排隊中的設定：還在清單上的伺服器統計保留，新的從零開始。
+    fn apply_pending(&mut self) {
+        let Some(settings) = self.pending.take() else {
+            return;
+        };
+        self.config.apply(&settings);
+        let old = std::mem::take(&mut self.stats);
+        self.stats = settings
+            .servers
+            .iter()
+            .map(|host| {
+                old.iter()
+                    .find(|s| &s.host == host)
+                    .cloned()
+                    .unwrap_or_else(|| ServerStats::new(host))
+            })
+            .collect();
+        self.publish_status();
+        self.emit(SamplerEvent::Reconfigured {
+            servers: settings.servers,
+        });
+    }
+
+    fn publish_status(&self) {
+        self.status.set(SyncStatus {
+            servers: self.stats.clone(),
+            samples: self.estimator.len(),
+            rejected: self.estimator.rejected(),
+            round: self.round,
+            settings: Some(SyncSettings::from_config(&self.config)),
+        });
     }
 
     fn emit(&mut self, event: SamplerEvent) {
@@ -397,14 +637,21 @@ impl Worker {
 
         let system_theta = system_theta_ns();
         let servers = self.config.servers.clone();
-        for host in servers {
+        for (i, host) in servers.into_iter().enumerate() {
             let addr = match resolve_ipv4(&host, self.config.port) {
                 Ok(addrs) => addrs[0],
                 Err(error) => {
+                    if let Some(s) = self.stats.get_mut(i) {
+                        s.record_failure(format!("解析失敗：{error}"), HostTime::now());
+                    }
+                    self.publish_status();
                     self.emit(SamplerEvent::ResolveFailed { host, error });
                     continue;
                 }
             };
+            if let Some(s) = self.stats.get_mut(i) {
+                s.addr = Some(addr);
+            }
             let results = query_burst(
                 &self.sock,
                 addr,
@@ -413,10 +660,26 @@ impl Worker {
                 self.config.spacing,
             );
             for result in results {
-                if let Ok(ex) = &result {
-                    self.estimator.push(ex.sample);
-                    self.last_success = Some(ex.sample.at);
-                    self.woke_since_success = false;
+                let now = HostTime::now();
+                match &result {
+                    Ok(ex) => {
+                        self.estimator.push(ex.sample);
+                        self.last_success = Some(ex.sample.at);
+                        self.woke_since_success = false;
+                        if let Some(s) = self.stats.get_mut(i) {
+                            s.record_ok(ex, now);
+                        }
+                    }
+                    Err(QueryError::NoMatchingResponse) => {
+                        if let Some(s) = self.stats.get_mut(i) {
+                            s.record_failure("逾時".into(), now);
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(s) = self.stats.get_mut(i) {
+                            s.record_failure(e.to_string(), now);
+                        }
+                    }
                 }
                 self.emit(SamplerEvent::Exchange {
                     host: host.clone(),
@@ -425,6 +688,8 @@ impl Worker {
                     system_theta_ns: system_theta,
                 });
             }
+            // 每台跑完就更新，選單不用等整輪。
+            self.publish_status();
         }
 
         // 這一輪跑到一半睡過：剛推進去的樣本混了睡前睡後，整個丟掉，不發布混合的模型。
@@ -447,6 +712,8 @@ impl Worker {
             self.woke_since_success,
         );
         self.slot.set(model);
+        // `model()` 才會重算剔除數，發布模型後再更新一次近況。
+        self.publish_status();
         self.emit(SamplerEvent::Published {
             model,
             samples: self.estimator.len(),
@@ -648,6 +915,143 @@ mod tests {
             half_width_ns: 5_000_000,
             half_width_growth_ns_per_s: 100.0,
         }
+    }
+
+    #[test]
+    fn sync_settings_are_validated() {
+        let ok = SyncSettings::new(
+            vec![" a.example ".into(), "b.example".into()],
+            4,
+            Duration::from_secs(1),
+            Duration::from_secs(180),
+        )
+        .unwrap();
+        assert_eq!(ok.servers, vec!["a.example", "b.example"]);
+        let s = Duration::from_secs(1);
+        let c = Duration::from_secs(180);
+        assert!(SyncSettings::new(vec![], 4, s, c).is_err());
+        assert!(SyncSettings::new(vec!["x".into(); 9], 4, s, c).is_err());
+        assert!(SyncSettings::new(vec!["a b".into()], 4, s, c).is_err());
+        assert!(SyncSettings::new(vec!["".into()], 4, s, c).is_err());
+        assert!(SyncSettings::new(vec!["a".into()], 0, s, c).is_err());
+        assert!(SyncSettings::new(vec!["a".into()], 9, s, c).is_err());
+        assert!(SyncSettings::new(vec!["a".into()], 4, Duration::from_millis(100), c).is_err());
+        assert!(SyncSettings::new(vec!["a".into()], 4, s, Duration::from_secs(30)).is_err());
+        let from = SyncSettings::from_config(&SamplerConfig::default());
+        assert_eq!(from.servers.len(), 3);
+        assert_eq!(from.cycle, Duration::from_secs(180));
+    }
+
+    #[test]
+    fn status_counts_failures_and_reconfigure_runs_a_cycle_immediately() {
+        let (tx, rx) = mpsc::channel();
+        let handle = spawn(
+            loopback_config(),
+            Box::new(move |e| {
+                let _ = tx.send(e);
+            }),
+        )
+        .unwrap();
+        let deadline = Duration::from_secs(5);
+        let initial = handle.status();
+        assert_eq!(initial.servers.len(), 1);
+        assert_eq!(initial.servers[0].host, "127.0.0.1");
+        assert_eq!(initial.settings.as_ref().unwrap().burst, 1);
+        loop {
+            if let SamplerEvent::Published { .. } = rx.recv_timeout(deadline).unwrap() {
+                break;
+            }
+        }
+        let after = handle.status();
+        assert_eq!(after.round, 1);
+        let s = &after.servers[0];
+        assert_eq!((s.ok, s.failed), (0, 1));
+        assert_eq!(s.last_error.as_deref(), Some("逾時"));
+        assert_eq!(s.addr.map(|a| a.port()), Some(9));
+        assert!(s.last_at.is_some() && s.last_success_at.is_none());
+
+        // 換成兩台（都指向沒人聽的 loopback）：立刻換上、第二輪馬上開始，舊的統計保留。
+        let settings = SyncSettings::new(
+            vec!["127.0.0.1".into(), "localhost".into()],
+            1,
+            Duration::from_millis(200),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        handle.reconfigure(settings.clone());
+        let mut reconfigured = false;
+        loop {
+            match rx.recv_timeout(deadline).unwrap() {
+                SamplerEvent::Reconfigured { servers } => {
+                    assert_eq!(servers, settings.servers);
+                    reconfigured = true;
+                }
+                SamplerEvent::CycleStarted { round: 2 } => {
+                    assert!(reconfigured, "要先換設定再開新的一輪");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let status = handle.status();
+        assert_eq!(status.settings.as_ref(), Some(&settings));
+        assert_eq!(status.servers.len(), 2);
+        assert_eq!(status.servers[0].failed, 1, "還在清單上的伺服器統計要保留");
+        assert_eq!(status.servers[1].host, "localhost");
+    }
+
+    #[test]
+    fn reconfigure_while_paused_waits_for_resume() {
+        let (tx, rx) = mpsc::channel();
+        let handle = spawn(
+            loopback_config(),
+            Box::new(move |e| {
+                let _ = tx.send(e);
+            }),
+        )
+        .unwrap();
+        let deadline = Duration::from_secs(5);
+        loop {
+            if let SamplerEvent::Published { .. } = rx.recv_timeout(deadline).unwrap() {
+                break;
+            }
+        }
+        handle.pause();
+        loop {
+            if let SamplerEvent::Paused = rx.recv_timeout(deadline).unwrap() {
+                break;
+            }
+        }
+        let settings = SyncSettings::new(
+            vec!["localhost".into()],
+            1,
+            Duration::from_millis(200),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        handle.reconfigure(settings.clone());
+        // 凍結中不換、不跑。
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(300)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(handle.status().servers[0].host, "127.0.0.1");
+
+        handle.resume();
+        let mut seen = Vec::new();
+        loop {
+            match rx.recv_timeout(deadline).unwrap() {
+                SamplerEvent::Resumed => seen.push("resumed"),
+                SamplerEvent::Reconfigured { .. } => seen.push("reconfigured"),
+                SamplerEvent::CycleStarted { round: 2 } => {
+                    seen.push("cycle");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(seen, ["resumed", "reconfigured", "cycle"]);
+        assert_eq!(handle.status().servers[0].host, "localhost");
     }
 
     #[test]

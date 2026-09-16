@@ -60,9 +60,31 @@ features = [
     "CAGradientLayer",
     "CALayer",
     "CAMediaTiming",
+    "CAMetalLayer",
     "CATransaction",
     "objc2-core-foundation",
     "objc2-core-graphics",
+    "objc2-metal",
+]
+
+[dependencies.objc2-metal]
+workspace = true
+features = [
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLDevice",
+    "MTLDrawable",
+    "MTLLibrary",
+    "MTLPixelFormat",
+    "MTLRenderCommandEncoder",
+    "MTLRenderPass",
+    "MTLRenderPipeline",
+    "MTLResource",
+    "MTLTexture",
+    "MTLTypes",
+    "block2",
+    "objc2-core-foundation",
 ]
 
 [dependencies.objc2-app-kit]

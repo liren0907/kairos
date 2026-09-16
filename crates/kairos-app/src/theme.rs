@@ -21,6 +21,7 @@ use objc2_foundation::NSString;
 use serde::Deserialize;
 
 use kairos_core::beat::audio::TickSound;
+use kairos_core::sync::{SamplerConfig, SyncSettings};
 
 /// 預設主題，也是第一次啟動時寫到磁碟的內容。
 pub const DEFAULT_THEME_TOML: &str = r##"# kairos 主題檔。存檔即時生效；寫錯會在終端機印出錯誤並沿用上一版。
@@ -61,6 +62,7 @@ idle_fps = 60          # 平常的刷新率；節拍期間會拉到面板所在�
 
 [beat]
 style = "auto"         # auto | ball | ring | pulse；auto＝ball，系統開「減少動態效果」時改 pulse
+renderer = "auto"      # auto | metal | layer；auto＝有 Metal 就用 Metal 畫節拍區並量每一格實際上屏的時刻，layer＝CALayer
 period_ms = 1000       # 拍距
 ticks = 4              # 拍數，含歸零那一拍；聲音從第一拍起，畫面提早一拍起跑
 strip_height = 64      # 節拍區高度（點），只在節拍期間出現在數字上方
@@ -74,6 +76,12 @@ tick_hz = 1000         # 前導拍與歸零拍同音高
 tick_ms = 30           # 前導拍長度
 final_ms = 200         # 歸零拍長度
 visual_lead_ms = 0     # 畫面相對聲音的提前量：正值＝畫面先到；主觀覺得畫面慢就調正
+
+[sync]                 # 時間來源；存檔就換上、立刻跑一輪（鎖定期間等解凍）。每台近況看選單的「時間來源」
+servers = ["time.stdtime.gov.tw", "time.google.com", "time.cloudflare.com"]  # 1 到 8 台
+burst = 4              # 每台每輪幾筆（1 到 8）
+spacing_ms = 1000      # 同一台兩筆的間隔（≥ 200）
+cycle_s = 180          # 兩輪之間的間隔（≥ 60）
 "##;
 
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
@@ -321,10 +329,21 @@ pub enum BeatStyle {
     Pulse,
 }
 
+/// 節拍區用什麼畫：`auto` 有 Metal 就用（順便量實際上屏時刻），`metal` 一樣但拿不到會大聲抱怨，
+/// `layer` 維持 CALayer。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BeatRenderer {
+    Auto,
+    Metal,
+    Layer,
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Beat {
     pub style: BeatStyle,
+    pub renderer: BeatRenderer,
     pub period_ms: f64,
     pub ticks: u32,
     pub strip_height: f64,
@@ -344,6 +363,7 @@ impl Default for Beat {
     fn default() -> Self {
         Beat {
             style: BeatStyle::Auto,
+            renderer: BeatRenderer::Auto,
             period_ms: 1000.0,
             ticks: 4,
             strip_height: 64.0,
@@ -384,6 +404,39 @@ impl Beat {
     }
 }
 
+/// `[sync]`：伺服器清單與取樣節奏。驗證在 core 的 `SyncSettings::new`。
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Sync {
+    pub servers: Vec<String>,
+    pub burst: usize,
+    pub spacing_ms: f64,
+    pub cycle_s: f64,
+}
+
+impl Default for Sync {
+    fn default() -> Self {
+        let c = SamplerConfig::default();
+        Sync {
+            servers: c.servers,
+            burst: c.burst,
+            spacing_ms: c.spacing.as_secs_f64() * 1e3,
+            cycle_s: c.cycle.as_secs_f64(),
+        }
+    }
+}
+
+impl Sync {
+    pub fn settings(&self) -> Result<SyncSettings, String> {
+        SyncSettings::new(
+            self.servers.clone(),
+            self.burst,
+            Duration::from_secs_f64(self.spacing_ms.max(0.0) / 1e3),
+            Duration::from_secs_f64(self.cycle_s.max(0.0)),
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Theme {
@@ -393,6 +446,7 @@ pub struct Theme {
     pub layout: Layout,
     pub display: Display,
     pub beat: Beat,
+    pub sync: Sync,
 }
 
 impl Theme {
@@ -418,7 +472,7 @@ impl Theme {
             eprintln!("主題：已建立 {}", path.display());
         }
         let text = fs::read_to_string(path)?;
-        for section in ["[display.screens]", "[beat]"] {
+        for section in ["[display.screens]", "[beat]", "[sync]"] {
             if !text.contains(section) {
                 eprintln!(
                     "主題：{} 沒有 {section} 段落，用預設值；想看所有可調的鍵，刪掉這個檔案重啟就會重新產生",
@@ -490,5 +544,38 @@ mod tests {
         assert_eq!(t.beat.visual_lead(), (false, Duration::from_millis(5)));
         assert_eq!(t.beat.sound().tick, Duration::from_millis(30));
         assert!(Theme::parse("[beat]\nstyle = \"bounce\"\n").is_err());
+        assert_eq!(
+            Theme::parse("[beat]\nrenderer = \"layer\"\n")
+                .unwrap()
+                .beat
+                .renderer,
+            BeatRenderer::Layer
+        );
+        assert!(Theme::parse("[beat]\nrenderer = \"vulkan\"\n").is_err());
+    }
+
+    #[test]
+    fn sync_section_maps_to_settings_and_reports_bad_values() {
+        let t = Theme::parse(
+            "[sync]\nservers = [\"tock.stdtime.gov.tw\", \"time.apple.com\"]\nburst = 2\nspacing_ms = 500\ncycle_s = 120\n",
+        )
+        .unwrap();
+        let s = t.sync.settings().unwrap();
+        assert_eq!(s.servers, vec!["tock.stdtime.gov.tw", "time.apple.com"]);
+        assert_eq!(s.burst, 2);
+        assert_eq!(s.spacing, Duration::from_millis(500));
+        assert_eq!(s.cycle, Duration::from_secs(120));
+
+        let defaults = Theme::default().sync.settings().unwrap();
+        assert_eq!(
+            defaults,
+            SyncSettings::from_config(&SamplerConfig::default())
+        );
+
+        let bad = Theme::parse("[sync]\nservers = []\n").unwrap();
+        assert!(bad.sync.settings().is_err());
+        let bad = Theme::parse("[sync]\ncycle_s = 5\n").unwrap();
+        assert!(bad.sync.settings().unwrap_err().contains("兩輪"));
+        assert!(Theme::parse("[sync]\nserver = [\"a\"]\n").is_err());
     }
 }

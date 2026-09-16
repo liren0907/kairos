@@ -161,6 +161,8 @@ struct BeatSession {
     /// 每一拍：離落地最近的一格（含提前量）差多少毫秒，正值代表那一格在落地之後。
     nearest_frame_ms: Vec<Option<f64>>,
     fps: f64,
+    /// 節拍期間每一格「回呼開始 − 上一次 vsync」的毫秒數：顯示連結的相位，跟上屏延遲一起看。
+    callback_late_ms: Vec<f64>,
 }
 
 fn abort_text(reason: AbortReason) -> &'static str {
@@ -190,6 +192,8 @@ struct State {
     _screen_observer: RefCell<Option<Retained<ProtocolObject<dyn NSObjectProtocol>>>>,
     smoother: RefCell<DisplaySmoother>,
     last_slewing: Cell<bool>,
+    /// 上一次節拍程序量到的「實際上屏 − 預測」中位數（毫秒），給選單細節列。
+    last_present_ms: Cell<Option<f64>>,
     local: RefCell<LocalTime>,
     link: RefCell<Option<Retained<CADisplayLink>>>,
     click_through: Cell<bool>,
@@ -315,19 +319,14 @@ impl Controller {
         &self.ivars().state
     }
 
+    /// `theme` 由 main 先讀好（取樣執行緒的設定也從它來），這裡只接手。
     pub fn new(
         mtm: MainThreadMarker,
         sampler: SamplerHandle,
+        theme: Theme,
         theme_path: PathBuf,
         store_path: PathBuf,
     ) -> Retained<Self> {
-        let theme = match Theme::load_or_create(&theme_path) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("主題：讀取 {} 失敗（{e}），用預設值", theme_path.display());
-                Theme::default()
-            }
-        };
         let views = build_panel(mtm, &theme);
         let flags = Arc::new(Flags::default());
         let watcher = {
@@ -373,6 +372,7 @@ impl Controller {
             _screen_observer: RefCell::new(None),
             smoother: RefCell::new(DisplaySmoother::new(SmootherConfig::default())),
             last_slewing: Cell::new(false),
+            last_present_ms: Cell::new(None),
             local: RefCell::new(LocalTime::new()),
             link: RefCell::new(None),
             click_through: Cell::new(false),
@@ -402,6 +402,11 @@ impl Controller {
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
         this.rebuild_face(false);
         this
+    }
+
+    /// 上一次節拍程序量到的「實際上屏 − 預測」中位數（毫秒）；還沒量過是 `None`。
+    pub fn last_present_ms(&self) -> Option<f64> {
+        self.state().last_present_ms.get()
     }
 
     pub fn set_menu_items(&self, items: MenuItems) {
@@ -537,10 +542,28 @@ impl Controller {
                     }
                     return;
                 }
+                let sync_changed = iv.theme.borrow().sync != new.sync;
                 *iv.theme.borrow_mut() = new;
                 self.rebuild_face(false);
                 self.refresh_screen(false);
                 eprintln!("主題：已重新載入 {}", iv.theme_path.display());
+                if sync_changed {
+                    match iv.theme.borrow().sync.settings() {
+                        Ok(s) => {
+                            eprintln!(
+                                "主題：[sync] 有變，換成 {}{}",
+                                s.servers.join("、"),
+                                if iv.sampler.is_paused() {
+                                    "（鎖定中，解凍後套用）"
+                                } else {
+                                    ""
+                                }
+                            );
+                            iv.sampler.reconfigure(s);
+                        }
+                        Err(e) => eprintln!("主題：[sync] 不合法（{e}），時間來源沿用上一版"),
+                    }
+                }
             }
             Err(e) => eprintln!(
                 "主題：{} 讀取失敗，沿用上一版：{e}",
@@ -703,6 +726,7 @@ impl Controller {
             glow,
             nearest_frame_ms: vec![None; plan.ticks as usize],
             fps: iv.screen_fps.get(),
+            callback_late_ms: Vec::with_capacity(512),
         });
         self.rebuild_face(true);
         self.refresh_menu();
@@ -729,6 +753,16 @@ impl Controller {
             session.fps,
             500.0 / session.fps.max(1.0)
         );
+        if !session.callback_late_ms.is_empty() {
+            let mut lates = session.callback_late_ms.clone();
+            lates.sort_by(|a, b| a.total_cmp(b));
+            line.push_str(&format!(
+                "，回呼晚於 vsync 中位 {:.2} ms（{:.2}–{:.2}）",
+                lates[lates.len() / 2],
+                lates[0],
+                lates[lates.len() - 1]
+            ));
+        }
         for (k, d) in session.nearest_frame_ms.iter().enumerate() {
             match d {
                 Some(d) => line.push_str(&format!("；第 {k} 拍最近一格差 {d:+.1} ms")),
@@ -736,6 +770,29 @@ impl Controller {
             }
         }
         eprintln!("{line}");
+        // Metal 節拍區：在重建面板（會拆掉圖層）之前把上屏統計拿走。
+        {
+            let (ahead, vlead) = iv.theme.borrow().beat.visual_lead();
+            let ticks: Vec<HostTime> = session
+                .plan
+                .tick_times()
+                .map(|(_, t)| if ahead { t - vlead } else { t + vlead })
+                .collect();
+            let summary = iv
+                .face
+                .borrow_mut()
+                .as_mut()
+                .and_then(|f| f.strip.as_mut())
+                .and_then(|s| s.metal_mut())
+                .map(|m| m.take_summary(&ticks));
+            if let Some(summary) = summary {
+                let (first, second) = summary.lines();
+                eprintln!("{first}");
+                eprintln!("{second}");
+                iv.last_present_ms
+                    .set(summary.offset_ms.map(|(mid, _, _)| mid));
+            }
+        }
         if let Some(g) = &session.glow {
             g.teardown();
         }
@@ -1323,6 +1380,14 @@ impl Controller {
         let lead = Duration::from_secs_f64(iv.lead_ms.get().max(0.0) / 1e3);
         // targetTimestamp 是 CACurrentMediaTime 基準的秒數，也就是 mach_absolute_time。
         let at = HostTime::from_nanos((target_s * 1e9) as u64) + lead;
+        if let Some(session) = iv.beat.borrow_mut().as_mut()
+            && session.callback_late_ms.len() < 4_096
+        {
+            let now_s = HostTime::now().as_nanos() as f64 / 1e9;
+            session
+                .callback_late_ms
+                .push((now_s - link.timestamp()) * 1e3);
+        }
 
         let model = iv.sampler.model();
         if iv.demo_pending.get() && model.is_usable() {
@@ -1396,7 +1461,7 @@ impl Controller {
                     .phase_at(at_v)
                     .unwrap_or_else(|| Phase::idle(&session.plan));
                 if let Some(strip) = face.strip.as_mut() {
-                    strip.render(&phase);
+                    strip.render(&phase, at);
                 }
                 if let Some(glow) = session.glow.as_mut() {
                     glow.set(glow_level(&phase), phase.is_final);

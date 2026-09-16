@@ -2,10 +2,53 @@
 //! 慣例跟 `sntp` 一樣：正值代表本機系統時鐘慢。
 
 use kairos_core::model::{ClockModel, ModelStatus};
+use kairos_core::sync::{ServerStats, SyncStatus};
 use kairos_core::time::HostTime;
 
 pub fn ms(ns: i128) -> f64 {
     ns as f64 / 1e6
+}
+
+/// 「時間來源」子選單的標題列：「視窗 12 筆，丟 0 筆，第 3 輪」。
+pub fn sync_header(status: &SyncStatus) -> String {
+    if status.round == 0 {
+        return "尚未取樣".to_string();
+    }
+    format!(
+        "視窗 {} 筆，丟 {} 筆，第 {} 輪",
+        status.samples, status.rejected, status.round
+    )
+}
+
+/// 「時間來源」子選單的一列：主機、位址、最近一次的結果、成功／失敗次數、多久前。
+pub fn server_row(s: &ServerStats, now: HostTime) -> String {
+    let Some(last_at) = s.last_at else {
+        return format!("{} · 尚未取樣", s.host);
+    };
+    let mut row = s.host.clone();
+    if let Some(addr) = s.addr {
+        row.push_str(&format!(" · {}", addr.ip()));
+    }
+    match &s.last_error {
+        Some(e) => row.push_str(&format!(" · {e}")),
+        None => {
+            if let Some(rtt) = s.last_round_trip {
+                row.push_str(&format!(" · 往返 {:.1} ms", rtt.as_secs_f64() * 1e3));
+            }
+            if let Some(hw) = s.last_half_width_ns {
+                row.push_str(&format!(" · ± {:.1} ms", ms(hw as i128)));
+            }
+            if let Some(st) = s.last_stratum {
+                row.push_str(&format!(" · s{st}"));
+                if let Some(id) = &s.last_reference_id {
+                    row.push_str(&format!(" {id}"));
+                }
+            }
+        }
+    }
+    let ago = now.saturating_duration_since(last_at).as_secs();
+    row.push_str(&format!(" · {} 成功 {} 失敗 · {ago} 秒前", s.ok, s.failed));
+    row
 }
 
 /// 可用狀態的字樣；不可用的狀態回傳 `Err(說明)`。
@@ -130,6 +173,47 @@ mod tests {
         assert_eq!(remaining_text(3_723 * S + 500_000_000), "還有 1:02:03");
         assert_eq!(remaining_text(-5 * S), "已過 0:05");
         assert_eq!(remaining_text(0), "還有 0:00");
+    }
+
+    #[test]
+    fn server_rows_cover_never_ok_and_failed() {
+        let now = HostTime::from_nanos(5_000_000_000_000);
+        let fresh = ServerStats::new("time.stdtime.gov.tw");
+        assert_eq!(server_row(&fresh, now), "time.stdtime.gov.tw · 尚未取樣");
+
+        let mut ok = ServerStats::new("time.google.com");
+        ok.addr = Some("216.239.35.8:123".parse().unwrap());
+        ok.ok = 12;
+        ok.last_round_trip = Some(Duration::from_micros(13_120));
+        ok.last_half_width_ns = Some(6_700_000);
+        ok.last_stratum = Some(1);
+        ok.last_reference_id = Some("GOOG".into());
+        ok.last_at = Some(now - Duration::from_secs(41));
+        ok.last_success_at = ok.last_at;
+        assert_eq!(
+            server_row(&ok, now),
+            "time.google.com · 216.239.35.8 · 往返 13.1 ms · ± 6.7 ms · s1 GOOG · 12 成功 0 失敗 · 41 秒前"
+        );
+
+        let mut failed = ok.clone();
+        failed.host = "time.cloudflare.com".into();
+        failed.failed = 4;
+        failed.last_error = Some("逾時".into());
+        failed.last_at = Some(now - Duration::from_secs(37));
+        assert_eq!(
+            server_row(&failed, now),
+            "time.cloudflare.com · 216.239.35.8 · 逾時 · 12 成功 4 失敗 · 37 秒前"
+        );
+
+        let status = SyncStatus {
+            servers: vec![fresh],
+            samples: 12,
+            rejected: 0,
+            round: 3,
+            settings: None,
+        };
+        assert_eq!(sync_header(&status), "視窗 12 筆，丟 0 筆，第 3 輪");
+        assert_eq!(sync_header(&SyncStatus::default()), "尚未取樣");
     }
 
     #[test]

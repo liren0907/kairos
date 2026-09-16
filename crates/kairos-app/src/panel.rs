@@ -19,7 +19,40 @@ use kairos_core::display::DIGIT_CELLS;
 
 use crate::atlas::GlyphAtlas;
 use crate::beat_view::{BeatStrip, StripKind};
-use crate::theme::Theme;
+use crate::metal_strip::MetalStrip;
+use crate::theme::{BeatRenderer, Theme};
+use kairos_core::beat::Phase;
+use kairos_core::time::HostTime;
+
+/// 節拍區的兩種畫法：CALayer 幾何，或 Metal（順便量實際上屏時刻）。
+pub enum Strip {
+    Layer(BeatStrip),
+    Metal(MetalStrip),
+}
+
+impl Strip {
+    /// 呼叫端要包在關掉隱式動畫的 `CATransaction` 裡。`target` 是這一格預定上屏的時刻。
+    pub fn render(&mut self, phase: &Phase, target: HostTime) {
+        match self {
+            Strip::Layer(s) => s.render(phase),
+            Strip::Metal(s) => s.render(phase, target),
+        }
+    }
+
+    pub fn teardown(&self) {
+        match self {
+            Strip::Layer(s) => s.teardown(),
+            Strip::Metal(s) => s.teardown(),
+        }
+    }
+
+    pub fn metal_mut(&mut self) -> Option<&mut MetalStrip> {
+        match self {
+            Strip::Metal(s) => Some(s),
+            Strip::Layer(_) => None,
+        }
+    }
+}
 
 /// 面板視窗與兩層 view。程式生命週期內不重建；主題變了只改屬性與大小。
 pub struct PanelViews {
@@ -139,7 +172,7 @@ pub struct Face {
     /// 面板內容區需要的高度（點）。
     pub height: f64,
     /// 節拍區，只在節拍期間有。
-    pub strip: Option<BeatStrip>,
+    pub strip: Option<Strip>,
     digits: Vec<Retained<CALayer>>,
     shown: [u8; DIGIT_CELLS],
     bar_track: Retained<CALayer>,
@@ -275,15 +308,40 @@ impl Face {
         });
 
         let strip = strip.map(|kind| {
-            BeatStrip::build(
-                &views.root_layer,
-                theme,
-                kind,
-                p,
-                digits_top + gap,
-                width - 2.0 * p,
-                strip_h,
-            )
+            let (x0, y0, w) = (p, digits_top + gap, width - 2.0 * p);
+            let metal = match theme.beat.renderer {
+                BeatRenderer::Layer => None,
+                BeatRenderer::Auto | BeatRenderer::Metal => {
+                    match MetalStrip::build(
+                        &views.root_layer,
+                        theme,
+                        kind,
+                        x0,
+                        y0,
+                        w,
+                        strip_h,
+                        scale,
+                    ) {
+                        Ok(m) => Some(m),
+                        Err(e) => {
+                            eprintln!("節拍區：Metal 建不起來（{e}），改用 CALayer");
+                            None
+                        }
+                    }
+                }
+            };
+            match metal {
+                Some(m) => Strip::Metal(m),
+                None => Strip::Layer(BeatStrip::build(
+                    &views.root_layer,
+                    theme,
+                    kind,
+                    x0,
+                    y0,
+                    w,
+                    strip_h,
+                )),
+            }
         });
 
         Face {

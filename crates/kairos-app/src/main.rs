@@ -15,12 +15,14 @@ mod calibrate;
 mod controller;
 mod glow;
 mod hotkey;
+mod metal_strip;
 mod panel;
 mod target_panel;
 mod target_store;
 mod text;
 mod theme;
 
+use std::cell::RefCell;
 use std::ptr::NonNull;
 
 use block2::RcBlock;
@@ -38,7 +40,7 @@ use objc2_foundation::{
     NSRunLoopCommonModes, NSString, NSTimer,
 };
 
-use kairos_core::sync::{SamplerConfig, SamplerHandle};
+use kairos_core::sync::{SamplerConfig, SamplerHandle, SyncStatus};
 use kairos_core::time::{HostTime, Timebase, system_theta_ns};
 
 use controller::{Controller, MenuItems};
@@ -61,16 +63,40 @@ fn disable_app_nap() -> AppNapGuard {
     }
 }
 
-/// 選單裡的兩列資訊：狀態列與細節列。停用的選單項是 macOS 資訊列的標準長相。
+/// 選單裡的資訊列：狀態列、細節列，以及「時間來源」子選單（標題列＋每台一列＋提示）。
+/// 停用的選單項是 macOS 資訊列的標準長相。
 struct StatusRows {
     primary: Retained<NSMenuItem>,
     detail: Retained<NSMenuItem>,
+    sources: Retained<NSMenu>,
+    sources_header: Retained<NSMenuItem>,
+    /// 每台伺服器一列，緊接在標題列後面；台數變了就重建。
+    source_rows: RefCell<Vec<Retained<NSMenuItem>>>,
 }
 
 impl StatusRows {
     fn set(&self, primary: &str, detail: &str) {
         self.primary.setTitle(&NSString::from_str(primary));
         self.detail.setTitle(&NSString::from_str(detail));
+    }
+
+    fn set_sources(&self, mtm: MainThreadMarker, status: &SyncStatus, now: HostTime) {
+        self.sources_header
+            .setTitle(&NSString::from_str(&text::sync_header(status)));
+        let mut rows = self.source_rows.borrow_mut();
+        if rows.len() != status.servers.len() {
+            for row in rows.drain(..) {
+                self.sources.removeItem(&row);
+            }
+            for (i, s) in status.servers.iter().enumerate() {
+                let row = info_row(mtm, &s.host);
+                self.sources.insertItem_atIndex(&row, (i + 1) as isize);
+                rows.push(row);
+            }
+        }
+        for (row, s) in rows.iter().zip(&status.servers) {
+            row.setTitle(&NSString::from_str(&text::server_row(s, now)));
+        }
     }
 }
 
@@ -128,12 +154,26 @@ fn build_status_item(
     let menu = NSMenu::new(mtm);
     // 自己管啟用狀態：「停止節拍」只在節拍進行中可按。
     menu.setAutoenablesItems(false);
+    let sources = NSMenu::new(mtm);
+    sources.setAutoenablesItems(false);
+    let sources_header = info_row(mtm, "尚未取樣");
+    sources.addItem(&sources_header);
+    sources.addItem(&NSMenuItem::separatorItem(mtm));
+    sources.addItem(&info_row(mtm, "改 theme.toml 的 [sync] 會自動套用"));
+    let sources_item = NSMenuItem::new(mtm);
+    sources_item.setTitle(&NSString::from_str("時間來源"));
+    sources_item.setSubmenu(Some(&sources));
+
     let rows = StatusRows {
         primary: info_row(mtm, "標準時間：校時中…"),
         detail: info_row(mtm, ""),
+        sources,
+        sources_header,
+        source_rows: RefCell::new(Vec::new()),
     };
     menu.addItem(&rows.primary);
     menu.addItem(&rows.detail);
+    menu.addItem(&sources_item);
     menu.addItem(&NSMenuItem::separatorItem(mtm));
 
     let target: &AnyObject = controller;
@@ -205,13 +245,22 @@ fn start_menu_refresh(
     mtm: MainThreadMarker,
     rows: StatusRows,
     sampler: SamplerHandle,
+    controller: Retained<Controller>,
 ) -> Retained<NSTimer> {
     let rows = MainThreadBound::new(rows, mtm);
+    let controller = MainThreadBound::new(controller, mtm);
     let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
         let mtm = MainThreadMarker::new().expect("主執行緒 run loop 的計時器只會在主執行緒觸發");
-        let (primary, detail) =
-            text::menu_rows(&sampler.model(), HostTime::now(), system_theta_ns());
-        rows.get(mtm).set(&primary, &detail);
+        let now = HostTime::now();
+        let (primary, mut detail) = text::menu_rows(&sampler.model(), now, system_theta_ns());
+        if let Some(present) = controller.get(mtm).last_present_ms()
+            && !detail.is_empty()
+        {
+            detail.push_str(&format!(" · 上屏 {present:+.1} ms"));
+        }
+        let rows = rows.get(mtm);
+        rows.set(&primary, &detail);
+        rows.set_sources(mtm, &sampler.status(), now);
     });
     // SAFETY: 閉包只捕捉 `MainThreadBound` 與 `SamplerHandle`，兩者都是 Send，
     // 滿足「block 必須 sendable」的要求。
@@ -264,19 +313,30 @@ fn main() {
     let _app_nap = disable_app_nap();
     eprintln!("App Nap 已關閉（UserInitiatedAllowingIdleSystemSleep | LatencyCritical）");
 
-    let config = SamplerConfig::default();
+    let theme_path = theme::Theme::default_path();
+    eprintln!("主題檔：{}", theme_path.display());
+    let theme = match theme::Theme::load_or_create(&theme_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("主題：讀取 {} 失敗（{e}），用預設值", theme_path.display());
+            theme::Theme::default()
+        }
+    };
+
+    let mut config = SamplerConfig::default();
+    match theme.sync.settings() {
+        Ok(s) => config.apply(&s),
+        Err(e) => eprintln!("主題：[sync] 不合法（{e}），用預設的時間來源"),
+    }
     eprintln!(
-        "取樣：{} 台伺服器，每台 {} 筆間隔 {:?}，每 {:?} 一輪",
-        config.servers.len(),
+        "取樣：{}，每台 {} 筆間隔 {:?}，每 {:?} 一輪",
+        config.servers.join("、"),
         config.burst,
         config.spacing,
         config.cycle
     );
     let sampler = kairos_core::sync::spawn(config, Box::new(|event| eprintln!("[取樣] {event}")))
         .expect("取樣執行緒啟動失敗");
-
-    let theme_path = theme::Theme::default_path();
-    eprintln!("主題檔：{}", theme_path.display());
     for screen in NSScreen::screens(mtm).iter() {
         let f = screen.frame();
         eprintln!(
@@ -289,11 +349,11 @@ fn main() {
     }
     let store_path = target_store::TargetFile::default_path();
     eprintln!("目標檔：{}", store_path.display());
-    let controller = Controller::new(mtm, sampler.clone(), theme_path, store_path);
+    let controller = Controller::new(mtm, sampler.clone(), theme, theme_path, store_path);
 
     let (_status_item, rows, items) = build_status_item(mtm, &controller);
     controller.set_menu_items(items);
-    let _refresh = start_menu_refresh(mtm, rows, sampler.clone());
+    let _refresh = start_menu_refresh(mtm, rows, sampler.clone(), controller.clone());
     let _wake_observer = observe_wake(sampler);
 
     {
