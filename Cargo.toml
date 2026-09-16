@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/kairos-core",
+    "crates/kairos-app",
     "spikes/so-timestamp",
     "spikes/cpal-hosttime",
 ]
@@ -11,5 +13,9 @@ rust-version = "1.85"
 license = "MIT"
 
 [workspace.dependencies]
+kairos-core = { path = "crates/kairos-core" }
 libc = "0.2"
 mach2 = "0.7"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"

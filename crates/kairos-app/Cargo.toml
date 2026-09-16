@@ -1,0 +1,35 @@
+[package]
+name = "kairos-app"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "kairos 的 macOS 殼：面板、選單列、畫面與聲音"
+
+[[bin]]
+name = "kairos"
+path = "src/main.rs"
+
+[dependencies]
+kairos-core.workspace = true
+objc2.workspace = true
+
+[dependencies.objc2-foundation]
+workspace = true
+features = ["NSObjCRuntime", "NSObject", "NSProcessInfo", "NSString"]
+
+[dependencies.objc2-app-kit]
+workspace = true
+features = [
+    "NSApplication",
+    "NSButton",
+    "NSControl",
+    "NSMenu",
+    "NSMenuItem",
+    "NSResponder",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSView",
+]

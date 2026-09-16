@@ -1,0 +1,11 @@
+[package]
+name = "kairos-core"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "kairos 的純 Rust 核心：單調時鐘、時鐘模型、時間來源與估計器的介面"
+
+[dependencies]
+mach2.workspace = true
