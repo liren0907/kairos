@@ -6,26 +6,18 @@
 //!
 //! 執行：`cargo run --release -p kairos-core --example ntp-probe`
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use kairos_core::estimate::Estimator;
 use kairos_core::estimate::interval::{EstimatorConfig, IntervalEstimator};
 use kairos_core::model::SourceKind;
 use kairos_core::source::client::{QueryError, query_burst};
 use kairos_core::source::udp::{TimestampedUdpSocket, resolve_ipv4};
-use kairos_core::time::HostTime;
+use kairos_core::time::{HostTime, system_theta_ns};
 
 const SERVERS: &[&str] = &["time.stdtime.gov.tw", "time.google.com", "time.cloudflare.com"];
 const BURST: usize = 4;
 const SPACING: Duration = Duration::from_secs(1);
-
-/// 本機系統時鐘相對單調時鐘的偏移：Unix 奈秒 − 開機起奈秒。
-/// 用它把 θ（遠端 − 單調）換成「遠端 − 系統時鐘」。
-fn system_theta_ns() -> i128 {
-    let host = HostTime::now();
-    let unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i128;
-    unix - host.as_nanos() as i128
-}
 
 fn ms(ns: i128) -> f64 {
     ns as f64 / 1e6

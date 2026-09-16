@@ -1,0 +1,572 @@
+//! 取樣執行緒與模型發布：把 [`source`](crate::source) 與 [`estimate`](crate::estimate)
+//! 放到背景執行緒定期跑，算好的 [`ClockModel`] 放進 [`ModelSlot`] 讓呈現層讀。
+//!
+//! ```text
+//! 取樣執行緒                                     主執行緒
+//! ─────────────────────────────                  ──────────────────────────
+//! 每輪：偵測睡眠 → DNS 重解 → 每台幾筆           slot.get() → estimate_at(now)
+//!       → estimator.push() → model() → slot.set()
+//!                        ◄── resample_now() ──   喚醒通知、使用者要求
+//! ```
+//!
+//! O(n³) 的 LP 只在這條執行緒每輪算一次；主執行緒每次讀到的是值型別的模型，
+//! `estimate_at` 是 O(1)，面板每一格讀都不會有負擔。
+//!
+//! 睡眠的處理由 [`SleepDetector`] 全權負責：`mach_absolute_time` 在睡眠期間停住，
+//! 睡前的樣本在醒來後全部失效，一定要清掉。`NSWorkspace` 的喚醒通知只是
+//! 「現在立刻取樣」的排程提示，不是唯一防線——通知到達的時間不受我們控制，
+//! 執行緒可能在通知之前就已經醒來跑了一輪。
+
+use std::fmt;
+use std::io;
+use std::net::SocketAddrV4;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use crate::estimate::Estimator;
+use crate::estimate::interval::{EstimatorConfig, IntervalEstimator};
+use crate::model::{ClockModel, ModelStatus, SourceKind};
+use crate::source::client::{QueryError, query_burst};
+use crate::source::ntp::Exchange;
+use crate::source::udp::{TimestampedUdpSocket, resolve_ipv4};
+use crate::time::{HostTime, Timebase, continuous_ticks, system_theta_ns};
+
+/// 取樣執行緒寫、呈現層讀的模型槽。`ClockModel` 是 `Copy`，讀出來就是一份快照。
+#[derive(Clone, Debug)]
+pub struct ModelSlot(Arc<Mutex<ClockModel>>);
+
+impl ModelSlot {
+    pub fn new(initial: ClockModel) -> ModelSlot {
+        ModelSlot(Arc::new(Mutex::new(initial)))
+    }
+
+    pub fn get(&self) -> ClockModel {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn set(&self, model: ClockModel) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = model;
+    }
+}
+
+/// 用 `mach_continuous_time − mach_absolute_time` 的增量偵測「中間睡過」。
+///
+/// 兩個時鐘同單位、同起點，差值就是開機以來睡掉的總時間；差值比上次多，就是又睡了一次。
+/// 兩次讀取之間有幾微秒的抖動，所以要有門檻；真正的睡眠最短也是秒級，門檻設幾百毫秒
+/// 既不會誤報也不會漏報。
+#[derive(Clone, Debug)]
+pub struct SleepDetector {
+    /// 上次看到的差值（tick）。
+    last_gap: u64,
+    threshold_ticks: u64,
+}
+
+impl SleepDetector {
+    /// 以現在的時鐘讀數當基準。
+    pub fn new(threshold: Duration) -> SleepDetector {
+        let tb = Timebase::get();
+        SleepDetector::from_readings(
+            HostTime::now().ticks(),
+            continuous_ticks(),
+            tb.duration_to_ticks(threshold),
+        )
+    }
+
+    /// 以指定讀數建立，給測試用。
+    pub fn from_readings(absolute: u64, continuous: u64, threshold_ticks: u64) -> SleepDetector {
+        SleepDetector {
+            last_gap: continuous.saturating_sub(absolute),
+            threshold_ticks,
+        }
+    }
+
+    /// 讀現在的時鐘，回傳自上次檢查以來睡掉的時間；沒睡回傳 `None`。
+    pub fn check(&mut self) -> Option<Duration> {
+        self.check_readings(HostTime::now().ticks(), continuous_ticks())
+            .map(|t| Timebase::get().ticks_to_duration(t))
+    }
+
+    /// 以指定讀數檢查，回傳睡掉的 tick 數。偵測到就把基準移到新的差值。
+    pub fn check_readings(&mut self, absolute: u64, continuous: u64) -> Option<u64> {
+        let gap = continuous.saturating_sub(absolute);
+        let slept = gap.saturating_sub(self.last_gap);
+        if slept >= self.threshold_ticks {
+            self.last_gap = gap;
+            Some(slept)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SamplerConfig {
+    /// 每輪都會重新解析的伺服器主機名。
+    pub servers: Vec<String>,
+    pub port: u16,
+    /// 每台每輪幾筆。
+    pub burst: usize,
+    /// 同一台連續兩筆的間隔。
+    pub spacing: Duration,
+    /// 兩輪之間的間隔（從上一輪結束算）。
+    pub cycle: Duration,
+    pub socket_timeout: Duration,
+    /// 超過這麼久沒有任何成功樣本，模型標成 `Stale`（數字照舊，半寬會隨漂移界變寬）。
+    pub stale_after: Duration,
+    /// 睡眠偵測的門檻。
+    pub sleep_threshold: Duration,
+    pub estimator: EstimatorConfig,
+}
+
+impl Default for SamplerConfig {
+    /// 3 分鐘一輪、三台各 4 筆：30 分鐘視窗裝 10 輪 120 筆，在估計器 160 筆的上限內；
+    /// 對每台伺服器平均 45 秒一筆，夠客氣。
+    fn default() -> Self {
+        SamplerConfig {
+            servers: vec![
+                "time.stdtime.gov.tw".into(),
+                "time.google.com".into(),
+                "time.cloudflare.com".into(),
+            ],
+            port: 123,
+            burst: 4,
+            spacing: Duration::from_secs(1),
+            cycle: Duration::from_secs(180),
+            socket_timeout: Duration::from_secs(2),
+            stale_after: Duration::from_secs(10 * 60),
+            sleep_threshold: Duration::from_millis(500),
+            estimator: EstimatorConfig::default(),
+        }
+    }
+}
+
+/// 取樣執行緒對外的事件，給記錄與日後的設定視窗用。
+#[derive(Debug)]
+pub enum SamplerEvent {
+    CycleStarted {
+        round: u64,
+    },
+    ResolveFailed {
+        host: String,
+        error: io::Error,
+    },
+    Exchange {
+        host: String,
+        addr: SocketAddrV4,
+        result: Result<Exchange, QueryError>,
+        /// 事件發生時的系統時鐘偏移，讓 `Display` 能印「遠端 − 系統時鐘」而不用自己讀時鐘。
+        system_theta_ns: i128,
+    },
+    /// 偵測到睡眠：樣本已清空、模型已標成不可用的 `Stale`。
+    SleepDetected {
+        slept: Duration,
+    },
+    Published {
+        model: ClockModel,
+        samples: usize,
+        rejected: usize,
+        system_theta_ns: i128,
+    },
+}
+
+fn ms(ns: i128) -> f64 {
+    ns as f64 / 1e6
+}
+
+impl fmt::Display for SamplerEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SamplerEvent::CycleStarted { round } => write!(f, "第 {round} 輪取樣"),
+            SamplerEvent::ResolveFailed { host, error } => write!(f, "{host}：解析失敗：{error}"),
+            SamplerEvent::Exchange {
+                host,
+                addr,
+                result: Ok(ex),
+                system_theta_ns,
+            } => write!(
+                f,
+                "{host}（{}）：往返 {:.2} ms，中點 {:+.3} ms ± {:.3} ms，stratum {} / {}",
+                addr.ip(),
+                ex.round_trip.as_secs_f64() * 1e3,
+                ms(ex.sample.midpoint_ns() - system_theta_ns),
+                ms(ex.sample.half_width_ns() as i128),
+                ex.response.stratum,
+                ex.response.reference_id_string(),
+            ),
+            SamplerEvent::Exchange {
+                host,
+                result: Err(QueryError::NoMatchingResponse),
+                ..
+            } => write!(f, "{host}：逾時"),
+            SamplerEvent::Exchange {
+                host,
+                result: Err(e),
+                ..
+            } => write!(f, "{host}：失敗：{e}"),
+            SamplerEvent::SleepDetected { slept } => {
+                write!(f, "偵測到睡眠 {:.1} 秒，樣本清空、重新校時", slept.as_secs_f64())
+            }
+            SamplerEvent::Published {
+                model,
+                samples,
+                rejected,
+                system_theta_ns,
+            } => {
+                if !model.is_usable() {
+                    return write!(f, "模型 {:?}：沒有可用樣本", model.status);
+                }
+                let e = model.estimate_at(model.reference);
+                write!(
+                    f,
+                    "模型 {:?}：{:+.3} ms ± {:.3} ms，漂移 {:+.1} ± {:.1} ppm，{samples} 筆，丟 {rejected} 筆",
+                    model.status,
+                    ms(e.remote_unix_ns - (model.reference.as_nanos() as i128 + system_theta_ns)),
+                    ms(e.half_width_ns as i128),
+                    model.drift * 1e6,
+                    model.half_width_growth_ns_per_s / 1_000.0,
+                )
+            }
+        }
+    }
+}
+
+enum Command {
+    Resample,
+}
+
+/// 取樣執行緒的控制把手。可以複製；所有把手都丟掉後，執行緒在當輪結束時退出。
+#[derive(Clone)]
+pub struct SamplerHandle {
+    slot: ModelSlot,
+    commands: mpsc::Sender<Command>,
+}
+
+impl SamplerHandle {
+    /// 目前發布的模型快照。
+    pub fn model(&self) -> ClockModel {
+        self.slot.get()
+    }
+
+    pub fn slot(&self) -> &ModelSlot {
+        &self.slot
+    }
+
+    /// 不等週期到，立刻跑下一輪。執行緒已退出時靜默忽略。
+    pub fn resample_now(&self) {
+        let _ = self.commands.send(Command::Resample);
+    }
+}
+
+/// 啟動取樣執行緒。socket 在呼叫端建立，開不起來就立刻回錯。
+pub fn spawn(
+    config: SamplerConfig,
+    on_event: Box<dyn FnMut(SamplerEvent) + Send>,
+) -> io::Result<SamplerHandle> {
+    let sock = TimestampedUdpSocket::new_ipv4(config.socket_timeout)?;
+    let slot = ModelSlot::new(ClockModel::uncalibrated(SourceKind::Standard, HostTime::now()));
+    let (tx, rx) = mpsc::channel();
+
+    let worker = Worker {
+        estimator: IntervalEstimator::new(SourceKind::Standard, config.estimator),
+        sleep: SleepDetector::new(config.sleep_threshold),
+        config,
+        sock,
+        slot: slot.clone(),
+        on_event,
+        round: 0,
+        last_success: None,
+        woke_since_success: false,
+    };
+    thread::Builder::new()
+        .name("kairos-sampler".into())
+        .spawn(move || worker.run(rx))?;
+
+    Ok(SamplerHandle { slot, commands: tx })
+}
+
+struct Worker {
+    config: SamplerConfig,
+    sock: TimestampedUdpSocket,
+    estimator: IntervalEstimator,
+    sleep: SleepDetector,
+    slot: ModelSlot,
+    on_event: Box<dyn FnMut(SamplerEvent) + Send>,
+    round: u64,
+    /// 最近一筆成功樣本的時刻。
+    last_success: Option<HostTime>,
+    /// 睡眠清空之後還沒有拿到新樣本；這段期間發布的是「不可用的 Stale」而不是 Uncalibrated。
+    woke_since_success: bool,
+}
+
+/// 一輪的結果：正常結束，或中途睡過、樣本已清空、應該立刻再跑一輪。
+enum CycleOutcome {
+    Published,
+    SleptMidCycle,
+}
+
+impl Worker {
+    fn run(mut self, rx: mpsc::Receiver<Command>) {
+        loop {
+            if let CycleOutcome::SleptMidCycle = self.cycle() {
+                continue;
+            }
+            match rx.recv_timeout(self.config.cycle) {
+                Ok(Command::Resample) | Err(RecvTimeoutError::Timeout) => {
+                    // 排隊的多個要求合併成一輪。
+                    while rx.try_recv().is_ok() {}
+                }
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    }
+
+    fn emit(&mut self, event: SamplerEvent) {
+        (self.on_event)(event);
+    }
+
+    fn cycle(&mut self) -> CycleOutcome {
+        self.round += 1;
+        if let Some(slept) = self.sleep.check() {
+            self.invalidate_after_sleep(slept);
+        }
+        self.emit(SamplerEvent::CycleStarted { round: self.round });
+
+        let system_theta = system_theta_ns();
+        let servers = self.config.servers.clone();
+        for host in servers {
+            let addr = match resolve_ipv4(&host, self.config.port) {
+                Ok(addrs) => addrs[0],
+                Err(error) => {
+                    self.emit(SamplerEvent::ResolveFailed { host, error });
+                    continue;
+                }
+            };
+            let results = query_burst(
+                &self.sock,
+                addr,
+                SourceKind::Standard,
+                self.config.burst,
+                self.config.spacing,
+            );
+            for result in results {
+                if let Ok(ex) = &result {
+                    self.estimator.push(ex.sample);
+                    self.last_success = Some(ex.sample.at);
+                    self.woke_since_success = false;
+                }
+                self.emit(SamplerEvent::Exchange {
+                    host: host.clone(),
+                    addr,
+                    result,
+                    system_theta_ns: system_theta,
+                });
+            }
+        }
+
+        // 這一輪跑到一半睡過：剛推進去的樣本混了睡前睡後，整個丟掉，不發布混合的模型。
+        if let Some(slept) = self.sleep.check() {
+            self.invalidate_after_sleep(slept);
+            return CycleOutcome::SleptMidCycle;
+        }
+
+        let now = HostTime::now();
+        let model = apply_staleness(
+            self.estimator.model(now),
+            now,
+            self.last_success,
+            self.config.stale_after,
+            self.woke_since_success,
+        );
+        self.slot.set(model);
+        self.emit(SamplerEvent::Published {
+            model,
+            samples: self.estimator.len(),
+            rejected: self.estimator.rejected(),
+            system_theta_ns: system_theta,
+        });
+        CycleOutcome::Published
+    }
+
+    fn invalidate_after_sleep(&mut self, slept: Duration) {
+        self.estimator.invalidate();
+        self.last_success = None;
+        self.woke_since_success = true;
+        let mut model = ClockModel::uncalibrated(SourceKind::Standard, HostTime::now());
+        model.status = ModelStatus::Stale;
+        self.slot.set(model);
+        self.emit(SamplerEvent::SleepDetected { slept });
+    }
+}
+
+/// 在估計器算出的狀態上套兩條規則：喚醒後還沒拿到新樣本 → 不可用的 `Stale`；
+/// 太久沒有成功樣本 → 數字照舊但標 `Stale`。
+fn apply_staleness(
+    mut model: ClockModel,
+    now: HostTime,
+    last_success: Option<HostTime>,
+    stale_after: Duration,
+    woke_since_success: bool,
+) -> ClockModel {
+    match last_success {
+        None if woke_since_success => model.status = ModelStatus::Stale,
+        None => {}
+        Some(t) if now.saturating_duration_since(t) > stale_after => {
+            model.status = ModelStatus::Stale;
+        }
+        Some(_) => {}
+    }
+    model
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slot_roundtrips_model() {
+        let m0 = ClockModel::uncalibrated(SourceKind::Standard, HostTime::from_ticks(1));
+        let slot = ModelSlot::new(m0);
+        assert_eq!(slot.get(), m0);
+
+        let mut m1 = m0;
+        m1.offset_ns = 42;
+        m1.status = ModelStatus::Tracking;
+        let other = slot.clone();
+        other.set(m1);
+        assert_eq!(slot.get(), m1);
+    }
+
+    #[test]
+    fn sleep_detector_ignores_jitter_below_threshold() {
+        let mut d = SleepDetector::from_readings(1_000, 5_000, 100);
+        // 差值 4_000 → 4_050：只多 50，低於門檻。
+        assert_eq!(d.check_readings(2_000, 6_050), None);
+        // 基準沒動，累積到 4_120 才報。
+        assert_eq!(d.check_readings(3_000, 7_120), Some(120));
+        // 之後以新的差值為基準。
+        assert_eq!(d.check_readings(4_000, 8_120), None);
+    }
+
+    #[test]
+    fn sleep_detector_reports_each_sleep_once() {
+        let mut d = SleepDetector::from_readings(0, 0, 10);
+        assert_eq!(d.check_readings(100, 100), None);
+        assert_eq!(d.check_readings(200, 1_200), Some(1_000));
+        assert_eq!(d.check_readings(300, 1_300), None);
+        assert_eq!(d.check_readings(400, 3_400), Some(2_000));
+    }
+
+    #[test]
+    fn sleep_detector_on_live_clocks_is_quiet_right_after_start() {
+        let mut d = SleepDetector::new(Duration::from_millis(500));
+        assert_eq!(d.check(), None);
+        assert_eq!(d.check(), None);
+    }
+
+    #[test]
+    fn sleep_detector_tolerates_continuous_read_before_absolute() {
+        // continuous 比 absolute 先讀，差值可能短暫小於基準，不能 panic 也不能誤報。
+        let mut d = SleepDetector::from_readings(1_000, 1_000, 10);
+        assert_eq!(d.check_readings(2_005, 2_000), None);
+    }
+
+    /// 指向沒人在聽的 loopback 埠：每筆都逾時，但整條執行緒的流程跑得到。
+    fn loopback_config() -> SamplerConfig {
+        SamplerConfig {
+            servers: vec!["127.0.0.1".into()],
+            port: 9,
+            burst: 1,
+            spacing: Duration::ZERO,
+            cycle: Duration::from_secs(60),
+            socket_timeout: Duration::from_millis(50),
+            ..SamplerConfig::default()
+        }
+    }
+
+    #[test]
+    fn resample_now_starts_a_new_cycle_before_the_period_ends() {
+        let (tx, rx) = mpsc::channel();
+        let handle = spawn(loopback_config(), Box::new(move |e| {
+            let _ = tx.send(e);
+        }))
+        .unwrap();
+
+        let mut rounds = Vec::new();
+        let deadline = Duration::from_secs(5);
+        // 第一輪：開始、一筆逾時、發布 Uncalibrated。
+        while rounds.is_empty() {
+            match rx.recv_timeout(deadline).unwrap() {
+                SamplerEvent::Published { model, .. } => {
+                    assert_eq!(model.status, ModelStatus::Uncalibrated);
+                    rounds.push(model);
+                }
+                SamplerEvent::Exchange { result, .. } => assert!(result.is_err()),
+                _ => {}
+            }
+        }
+        assert!(!handle.model().is_usable());
+
+        // 週期是 60 秒，靠 resample_now 才會在幾秒內看到第二輪。
+        handle.resample_now();
+        loop {
+            if let SamplerEvent::CycleStarted { round: 2 } = rx.recv_timeout(deadline).unwrap() {
+                break;
+            }
+        }
+    }
+
+    fn tracking(reference: HostTime) -> ClockModel {
+        ClockModel {
+            source: SourceKind::Standard,
+            status: ModelStatus::Tracking,
+            reference,
+            offset_ns: 1_700_000_000_000_000_000,
+            drift: 0.0,
+            half_width_ns: 5_000_000,
+            half_width_growth_ns_per_s: 100.0,
+        }
+    }
+
+    #[test]
+    fn staleness_after_wake_without_samples_is_unusable_stale() {
+        let now = HostTime::from_nanos(1_000_000_000_000);
+        let m = apply_staleness(
+            ClockModel::uncalibrated(SourceKind::Standard, now),
+            now,
+            None,
+            Duration::from_secs(600),
+            true,
+        );
+        assert_eq!(m.status, ModelStatus::Stale);
+        assert!(!m.is_usable());
+    }
+
+    #[test]
+    fn staleness_without_wake_and_without_samples_stays_uncalibrated() {
+        let now = HostTime::from_nanos(1_000_000_000_000);
+        let m = apply_staleness(
+            ClockModel::uncalibrated(SourceKind::Standard, now),
+            now,
+            None,
+            Duration::from_secs(600),
+            false,
+        );
+        assert_eq!(m.status, ModelStatus::Uncalibrated);
+    }
+
+    #[test]
+    fn staleness_keeps_numbers_when_samples_are_old() {
+        let now = HostTime::from_nanos(1_000_000_000_000);
+        let old = now - Duration::from_secs(601);
+        let m = apply_staleness(tracking(now), now, Some(old), Duration::from_secs(600), false);
+        assert_eq!(m.status, ModelStatus::Stale);
+        assert!(m.is_usable());
+        assert_eq!(m.offset_ns, tracking(now).offset_ns);
+
+        let fresh = now - Duration::from_secs(30);
+        let m = apply_staleness(tracking(now), now, Some(fresh), Duration::from_secs(600), false);
+        assert_eq!(m.status, ModelStatus::Tracking);
+    }
+}

@@ -14,10 +14,23 @@ path = "src/main.rs"
 [dependencies]
 kairos-core.workspace = true
 objc2.workspace = true
+block2.workspace = true
+dispatch2.workspace = true
 
 [dependencies.objc2-foundation]
 workspace = true
-features = ["NSObjCRuntime", "NSObject", "NSProcessInfo", "NSString"]
+features = [
+    "NSDate",
+    "NSNotification",
+    "NSObjCRuntime",
+    "NSObject",
+    "NSOperation",
+    "NSProcessInfo",
+    "NSRunLoop",
+    "NSString",
+    "NSTimer",
+    "block2",
+]
 
 [dependencies.objc2-app-kit]
 workspace = true
@@ -32,4 +45,5 @@ features = [
     "NSStatusBarButton",
     "NSStatusItem",
     "NSView",
+    "NSWorkspace",
 ]

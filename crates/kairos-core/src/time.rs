@@ -7,7 +7,7 @@
 
 use std::ops::{Add, Sub};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// `mach_timebase_info`：tick 與奈秒的換算比。程式生命週期內不變，讀一次快取。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,6 +121,29 @@ impl HostTime {
     pub fn elapsed(self) -> Duration {
         HostTime::now().saturating_duration_since(self)
     }
+}
+
+/// 現在的 `mach_continuous_time`，單位同樣是 tick，但**睡眠期間也會走**。
+///
+/// `mach_absolute_time` 在系統睡眠時停住，所以兩者的差在一次開機內只會因睡眠而增加；
+/// [`crate::sync::SleepDetector`] 靠這個差偵測「中間睡過」。程式的時間基準仍然是
+/// [`HostTime`]，這個值不拿來算任何時刻。
+pub fn continuous_ticks() -> u64 {
+    // SAFETY: 無參數、無副作用的系統呼叫。
+    unsafe { mach2::mach_time::mach_continuous_time() }
+}
+
+/// 本機系統時鐘相對單調時鐘的偏移：Unix 奈秒 − 開機起奈秒。
+///
+/// 用它把模型的 θ（遠端 − 單調）換成人看得懂的「遠端 − 系統時鐘」，跟 `sntp` 的慣例一樣，
+/// 正值代表本機系統時鐘慢。系統時鐘會被 timed 慢慢調，所以每次要用都重讀，不要存。
+pub fn system_theta_ns() -> i128 {
+    let host = HostTime::now();
+    let unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0);
+    unix - host.as_nanos() as i128
 }
 
 impl Add<Duration> for HostTime {
